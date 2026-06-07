@@ -353,8 +353,14 @@ class Encoder3d(nn.Module):
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
                  dropout=0.0,
-                 add_stages=None):  # [NEW - oliviaa] list of {'mode': str, 'num_res_blocks': int}
+                 add_stages=None,  # [NEW - oliviaa] list of {'mode': str, 'num_res_blocks': int}
+                 use_b_adaptive=False,  # [NEW - oliviaa/B-fix] encoder.head[-1] 을 AdaptiveWeightedCausalConv3d 으로 교체 (= single backward path 의 weight gradient ratio mechanism)
+                 b_adaptive_eps=1e-6,
+                 b_adaptive_max=1e7,
+                 b_adaptive_disc_weight=1.0):
         super().__init__()
+        # [NEW - oliviaa/B-fix] flag 저장 — forward 에서 head 의 마지막 layer 의 두 output 처리 결정
+        self.use_b_adaptive = use_b_adaptive
         self.dim = dim
         self.z_dim = z_dim
         self.dim_mult = dim_mult
@@ -418,9 +424,21 @@ class Encoder3d(nn.Module):
             ResidualBlock(out_dim, out_dim, dropout))
 
         # output blocks
+        # [NEW - oliviaa/B-fix] use_b_adaptive=True 시 마지막 conv = AdaptiveWeightedCausalConv3d (= (B) 식 의 weight gradient ratio mechanism)
+        if use_b_adaptive:
+            # local import — circular import 방지
+            from adaptive_weighted_causal_conv_3d import AdaptiveWeightedCausalConv3d
+            _last_conv = AdaptiveWeightedCausalConv3d(
+                out_dim, z_dim, 3, padding=1,
+                adaptive_weight_eps=b_adaptive_eps,
+                adaptive_weight_max=b_adaptive_max,
+                disc_weight=b_adaptive_disc_weight,
+            )
+        else:
+            _last_conv = CausalConv3d(out_dim, z_dim, 3, padding=1)
         self.head = nn.Sequential(
             RMS_norm(out_dim, images=False), nn.SiLU(),
-            CausalConv3d(out_dim, z_dim, 3, padding=1))
+            _last_conv)
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
@@ -506,6 +524,9 @@ class Encoder3d(nn.Module):
                 x = layer(x)
 
         ## head
+        # [NEW - oliviaa/B-fix] use_b_adaptive=True 시 마지막 layer = AdaptiveWeightedCausalConv3d
+        #                       → forward 시 (y_main, y_adv) tuple 반환 가능
+        #                       → 호출 측 (= GeopriorVAE.encode) 에서 처리
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
@@ -522,6 +543,10 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+        # [NEW - oliviaa/B-fix] inference (= feat_cache is not None) 시 = backward 없음 → main only
+        # training (= feat_cache is None) + use_b_adaptive=True 시 = tuple 그대로 → 호출 측 처리
+        if isinstance(x, tuple) and feat_cache is not None:
+            x = x[0]
         return x
 
 
@@ -868,7 +893,11 @@ class WanVAE_(nn.Module):
                  subsample_mode='avg_pool',   # [NEW - oliviaa/geoprior] 'avg_pool' | 'stride' | 'bilinear'
                  prior_z_dim=None,            # [NEW - oliviaa/geoprior] None → same as z_dim; int for asymmetric (e.g. 16 for frozen Wan)
                  expand_conv2=True,           # [NEW - oliviaa/geoprior] True: conv2 z_dim→z_dim; False: conv2 z_dim→prior_z_dim (old)
-                 expand_encoder_head=False):  # [NEW - oliviaa/geoprior] True: encoder.head outputs z_dim*2 (instead of prior_z_dim*2)
+                 expand_encoder_head=False,   # [NEW - oliviaa/geoprior] True: encoder.head outputs z_dim*2 (instead of prior_z_dim*2)
+                 use_b_adaptive=False,        # [NEW - oliviaa/B-fix] encoder.head[-1] = AdaptiveWeightedCausalConv3d (= single backward weight ratio)
+                 b_adaptive_eps=1e-6,
+                 b_adaptive_max=1e7,
+                 b_adaptive_disc_weight=1.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -890,7 +919,11 @@ class WanVAE_(nn.Module):
         enc_out_dim = (self.prior_z_dim * 2) if (dual_branch and not expand_encoder_head) else (z_dim * 2)
         self.encoder = Encoder3d(dim, enc_out_dim, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_downsample, dropout,
-                                 add_stages=add_encoder_stages)
+                                 add_stages=add_encoder_stages,
+                                 use_b_adaptive=use_b_adaptive,
+                                 b_adaptive_eps=b_adaptive_eps,
+                                 b_adaptive_max=b_adaptive_max,
+                                 b_adaptive_disc_weight=b_adaptive_disc_weight)
         # conv1: asymmetric (prior_z_dim*2 → z_dim*2) when dual_branch, square otherwise
         self.conv1 = CausalConv3d(enc_out_dim, z_dim * 2, 1)
         # conv2: expand_conv2=True → z_dim→z_dim; False → z_dim→prior_z_dim (old behavior)
@@ -929,7 +962,14 @@ class WanVAE_(nn.Module):
             self._cached_prior_conv_num = count_conv3d(self.prior_encoder)
 
     def forward(self, x):
-        mu, log_var = self.encode(x, scale=None)
+        # [NEW - oliviaa/B-fix] encode 의 return 가 tuple ((mu, log_var), (mu_adv, log_var_adv)) 가능
+        # 단 GeopriorVAE.forward 은 일반 reconstruction path — main branch (= first) 만 사용.
+        # 호출 측 (= GeopriorDiTAlignModel.forward 등) 에서 use_b_adaptive 시 adv branch 별도 처리.
+        encode_result = self.encode(x, scale=None)
+        if isinstance(encode_result[0], tuple):
+            (mu, log_var), _ = encode_result    # adv branch 무시 (= 일반 forward path)
+        else:
+            mu, log_var = encode_result
         z = self.reparameterize(mu, log_var)
         if self.dual_branch:
             with torch.no_grad():
@@ -966,6 +1006,22 @@ class WanVAE_(nn.Module):
                         feat_cache=self._enc_feat_map,
                         feat_idx=self._enc_conv_idx)
                     out = torch.cat([out, out_], 2)
+        # [NEW - oliviaa/B-fix] out 가 tuple (y_main, y_adv) 가능 — use_b_adaptive=True + training 시
+        if isinstance(out, tuple):
+            out_main, out_adv = out
+            mu_main, log_var_main = self.conv1(out_main).chunk(2, dim=1)
+            mu_adv,  log_var_adv  = self.conv1(out_adv).chunk(2, dim=1)
+            if scale is not None:
+                if isinstance(scale[0], torch.Tensor):
+                    _sc0 = scale[0].view(1, self.z_dim, 1, 1, 1)
+                    _sc1 = scale[1].view(1, self.z_dim, 1, 1, 1)
+                else:
+                    _sc0, _sc1 = scale[0], scale[1]
+                mu_main = (mu_main - _sc0) * _sc1
+                mu_adv  = (mu_adv  - _sc0) * _sc1
+            self.clear_cache()
+            return (mu_main, log_var_main), (mu_adv, log_var_adv)
+
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if scale is not None:
             if isinstance(scale[0], torch.Tensor):
@@ -1127,6 +1183,10 @@ def _video_vae_geoprior(pretrained_path=None, z_dim=None, device='cpu',
                          decoder_conv1_zmain_init='zero',  # [NEW] 'zero' or 'pretrained' for z_main ch
                          expand_conv2=True,  # [NEW] True: conv2 z_dim→z_dim; False: conv2 z_dim→prior_z_dim (old)
                          expand_encoder_head=False,  # [NEW] True: encoder.head outputs z_dim*2 (instead of prior_z_dim*2)
+                         use_b_adaptive=False,        # [NEW - oliviaa/B-fix]
+                         b_adaptive_eps=1e-6,
+                         b_adaptive_max=1e7,
+                         b_adaptive_disc_weight=1.0,
                          **kwargs):
     cfg = dict(
         dim=96,
@@ -1145,6 +1205,10 @@ def _video_vae_geoprior(pretrained_path=None, z_dim=None, device='cpu',
         prior_z_dim=prior_z_dim if dual_branch else None,
         expand_conv2=expand_conv2,
         expand_encoder_head=expand_encoder_head,
+        use_b_adaptive=use_b_adaptive,
+        b_adaptive_eps=b_adaptive_eps,
+        b_adaptive_max=b_adaptive_max,
+        b_adaptive_disc_weight=b_adaptive_disc_weight,
     )
     cfg.update(**kwargs)
     model = WanVAE_(**cfg)

@@ -39,8 +39,16 @@ _parser.add_argument('--decoder_conv1_zmain_init', type=str, default='zero',
                      choices=['zero', 'pretrained'])
 _parser.add_argument('--no_expand_conv2', action='store_true')
 _parser.add_argument('--expand_encoder_head', action='store_true')
+_parser.add_argument('--use_b_adaptive', action='store_true', default=False,
+                     help="[NEW - oliviaa/B-fix] encoder.head[-1] 의 (B) 식 mechanism")
 _known, _remaining = _parser.parse_known_args()
+# [FIX - oliviaa/B-fix] _parser 가 --use_b_adaptive 의 추출 → sys.argv 에서 제거 →
+# main parser 가 받지 못함 → args.use_b_adaptive = False (= 학습 의 다른 부분 의 verify log fail)
+# 해결: _remaining 에 --use_b_adaptive 다시 inject — 두 parser 모두 처리
 sys.argv = [sys.argv[0]] + _remaining
+# main parser 도 --use_b_adaptive 의 받기 위해 re-inject
+if _known.use_b_adaptive:
+    sys.argv.append('--use_b_adaptive')
 
 dual_branch = not _known.no_dual_branch
 _tail_stages = _json.loads(_known.add_decoder_tail_stages) if _known.add_decoder_tail_stages else None
@@ -55,6 +63,7 @@ kinemadae._video_vae = partial(
     decoder_conv1_zmain_init=_known.decoder_conv1_zmain_init,
     expand_conv2=not _known.no_expand_conv2,
     expand_encoder_head=_known.expand_encoder_head,
+    use_b_adaptive=_known.use_b_adaptive,  # [NEW - oliviaa/B-fix]
 )
 sys.modules['kinemadae'] = kinemadae
 
@@ -149,10 +158,25 @@ class GeopriorDiTAlignModel(nn.Module):
                  decoder_noise_warmup_power=1.0,
                  align_weight=0.0, align_adaptive_weight=False,
                  use_2backward_adaptive=False, adaptive_max_weight=1e4,
+                 use_b_adaptive=False,  # [NEW - oliviaa/B-fix] single backward path 의 weight gradient ratio mechanism
                  normalize_zmain_bn=False, bn_momentum=0.1, zmain_bn_init='zprior',
-                 z_dim=16):
+                 z_dim=16,
+                 use_align_projection=False, align_proj_dim=5120, align_proj_num_blocks=40,
+                 align_projection_init='zero'):
         super().__init__()
         self.vae = vae
+        # [NEW - oliviaa] block 별 residual projection (trilinear 후 conv3d residual, zero init)
+        if use_align_projection:
+            self.align_projections = nn.ModuleList([
+                nn.Conv3d(align_proj_dim, align_proj_dim, kernel_size=3, padding=1)
+                for _ in range(align_proj_num_blocks)
+            ])
+            if align_projection_init == 'zero':
+                for m in self.align_projections:
+                    nn.init.zeros_(m.weight)
+                    nn.init.zeros_(m.bias)
+        else:
+            self.align_projections = None
         self.normalize_zprior = normalize_zprior
         if normalize_zprior:
             self.register_buffer('prior_mean', self._prior_mean.clone())
@@ -209,6 +233,7 @@ class GeopriorDiTAlignModel(nn.Module):
         # compute_adaptive_weight_2bwd() and scales align_loss explicitly.
         self.use_2backward_adaptive = use_2backward_adaptive
         self.adaptive_max_weight = adaptive_max_weight
+        self.use_b_adaptive = use_b_adaptive  # [NEW - oliviaa/B-fix]
 
     def _norm_zprior(self, z_prior):
         if self.normalize_zprior:
@@ -240,8 +265,28 @@ class GeopriorDiTAlignModel(nn.Module):
         return z_main
 
     def forward(self, x):
-        mu, log_var = self.vae.encode(x, scale=None)
-        z_main = self.vae.reparameterize(mu, log_var)
+        # [NEW - oliviaa/B-fix] encode 의 return 가 tuple ((mu, log_var), (mu_adv, log_var_adv))
+        # 가능 — use_b_adaptive=True + training 시.
+        # 두 branch 모두 처리 (= rec, align 별도 graph node, same value).
+        encode_result = self.vae.encode(x, scale=None)
+        _is_b_adaptive_path = (isinstance(encode_result, tuple)
+                                and len(encode_result) == 2
+                                and isinstance(encode_result[0], tuple))
+        if _is_b_adaptive_path:
+            (mu, log_var), (mu_adv, log_var_adv) = encode_result
+        else:
+            mu, log_var = encode_result
+
+        # reparameterize — same noise 두 branch 공유 (= 2backward 와 동등 비교 위함)
+        if _is_b_adaptive_path:
+            _std = torch.exp(0.5 * log_var)
+            _noise = torch.randn_like(_std)
+            z_main = _noise * _std + mu
+            _std_adv = torch.exp(0.5 * log_var_adv)
+            z_main_adv = _noise * _std_adv + mu_adv
+        else:
+            z_main = self.vae.reparameterize(mu, log_var)
+
         with torch.no_grad():
             z_prior = self.vae._encode_prior(x)
             z_prior = self._norm_zprior(z_prior)
@@ -250,15 +295,17 @@ class GeopriorDiTAlignModel(nn.Module):
         z_main_align = self._norm_zmain(z_main)
         z_cat = torch.cat([z_main_align, z_prior], dim=1)
 
-        # Adaptive gradient weighting: split z_cat so that g_loss and align_loss
-        # both flow back through the same representation level.  z_cat_rec feeds
-        # the decoder (→ recon → disc); z_cat is returned for the alignment path.
-        # Only active during training and when align_adaptive_weight is enabled
-        # AND we are NOT in legacy 2-backward mode (use_2backward_adaptive=True
-        # disables the autograd.Function split — adaptive weight comes from
-        # compute_adaptive_weight_2bwd() in the train loop instead).
-        if (self.training and self.align_adaptive_weight and self.align_weight > 0
+        # Adaptive gradient weighting:
+        # [NEW - oliviaa/B-fix] use_b_adaptive=True 시 — encode 가 이미 두 view 분기 →
+        # z_cat_rec / z_cat 도 두 branch 의 별도 결과 사용. _AdaptiveWeightingFn.apply 사용 안 함.
+        if self.use_b_adaptive and _is_b_adaptive_path:
+            # adv branch 도 normalize + cat
+            z_main_adv_align = self._norm_zmain(z_main_adv)
+            z_cat_rec   = z_cat                                       # main = rec branch (= decoder)
+            z_cat       = torch.cat([z_main_adv_align, z_prior], 1)   # adv = align branch
+        elif (self.training and self.align_adaptive_weight and self.align_weight > 0
                 and not self.use_2backward_adaptive):
+            # 기존 single backward path (= activation gradient ratio)
             z_cat_rec, z_cat = _AdaptiveWeightingFn.apply(
                 z_cat, z_cat.clone(), self.align_weight, 1e-6, self.adaptive_max_weight)
         else:
@@ -399,11 +446,14 @@ def compute_adaptive_weight_2bwd(rec_loss, align_loss, last_layer, max_weight=1e
     """
     rec_grads   = torch.autograd.grad(rec_loss,   last_layer, retain_graph=True)[0]
     align_grads = torch.autograd.grad(align_loss, last_layer, retain_graph=True)[0]
-    w = torch.norm(rec_grads) / (torch.norm(align_grads) + eps)
+    rec_norm = torch.norm(rec_grads)
+    align_norm = torch.norm(align_grads)
+    w = rec_norm / (align_norm + eps)
     w_raw = w.detach()
     if max_weight > 0:
         w = w.clamp(0.0, max_weight)
-    return w.detach(), w_raw
+    # [DEBUG v23] norm 도 반환 (= (B) AW backward 의 grad_W_main_norm/adv_norm 과 비교)
+    return w.detach(), w_raw, rec_norm.detach(), align_norm.detach()
 
 
 
@@ -494,12 +544,16 @@ def save_checkpoint(
     filename="checkpoint.ckpt",
     ema_state_dict={},
     lora_state_dict={},
+    optimizer_step=None,
+    grad_accum_steps=None,
 ):
     filepath = checkpoint_dir / Path(filename)
     torch.save(
         {
             "epoch": epoch,
             "current_step": current_step,
+            "optimizer_step": optimizer_step,  # accum 변경 시 wandb step 일관성 유지
+            "grad_accum_steps": grad_accum_steps,  # save 시점의 accum (resume 시 fallback 계산용)
             "optimizer_state": optimizer_state,
             "state_dict": state_dict,
             "ema_state_dict": ema_state_dict,
@@ -1022,10 +1076,16 @@ def train(args):
         align_adaptive_weight=args.align_adaptive_weight,
         use_2backward_adaptive=getattr(args, 'use_2backward_adaptive', False),
         adaptive_max_weight=getattr(args, 'adaptive_max_weight', 1e4),
+        use_b_adaptive=getattr(args, 'use_b_adaptive', False),  # [NEW - oliviaa/B-fix]
         normalize_zmain_bn=getattr(args, 'normalize_zmain_bn', False),
         bn_momentum=getattr(args, 'bn_momentum', 0.1),
         zmain_bn_init=getattr(args, 'zmain_bn_init', 'zprior'),
         z_dim=args.z_dim,
+        # [NEW - oliviaa] block 별 align projection
+        use_align_projection=getattr(args, 'use_align_projection', False),
+        align_proj_dim=getattr(args, 'align_proj_dim', 5120),
+        align_proj_num_blocks=getattr(args, 'align_num_blocks', 40),
+        align_projection_init=getattr(args, 'align_projection_init', 'zero'),
     )
     # [NEW] SyncBN convert (multi-GPU 면) — REPA-E 따라
     if getattr(args, 'normalize_zmain_bn', False) and dist.get_world_size() > 1:
@@ -1153,6 +1213,8 @@ def train(args):
         modules_to_train.append(patchify_module)
     if getattr(args, 'expand_encoder_head', False):
         modules_to_train += [vae_module.encoder.head, vae_module.conv1]
+    if getattr(model.module, 'align_projections', None) is not None:
+        modules_to_train.append(model.module.align_projections)
 
     param_groups = [{'params': vae_params, 'lr': args.lr}]
     if patchify_params:
@@ -1165,6 +1227,13 @@ def train(args):
             if global_rank == 0:
                 logger.info(f"[LoRA] optimizer received {len(lora_params)} param tensors "
                             f"({sum(p.numel() for p in lora_params):,} elements) at lr={args.patchify_lr}")
+    if getattr(model.module, 'align_projections', None) is not None:
+        align_proj_params = [p for p in model.module.align_projections.parameters() if p.requires_grad]
+        if align_proj_params:
+            param_groups.append({'params': align_proj_params, 'lr': args.patchify_lr})
+            if global_rank == 0:
+                logger.info(f"[align_proj] optimizer received {len(align_proj_params)} param tensors "
+                            f"({sum(p.numel() for p in align_proj_params):,} elements) at lr={args.patchify_lr}")
     gen_optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     disc_optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()), lr=args.lr, weight_decay=0.01
@@ -1211,8 +1280,18 @@ def train(args):
         ddp_sampler.load_state_dict(checkpoint["sampler_state"])
         start_epoch = checkpoint["sampler_state"]["epoch"]
         current_step = checkpoint["current_step"]
+        # accum 변경 시 wandb step 일관성 유지:
+        # 1) ckpt 에 optimizer_step 있으면 그대로 복원
+        # 2) 없으면 ckpt 의 grad_accum_steps 로 계산 (= current_step // ckpt_accum)
+        # 3) 둘 다 없으면 학습 시점의 args.grad_accum_steps 로 fallback
+        _ckpt_optim_step = checkpoint.get("optimizer_step", None)
+        # fallback 우선순위: ckpt 의 grad_accum_steps → args.resume_ckpt_grad_accum → args.grad_accum_steps
+        _ckpt_accum = (checkpoint.get("grad_accum_steps", None)
+                       or getattr(args, 'resume_ckpt_grad_accum', None)
+                       or args.grad_accum_steps)
+        _resume_optim_step = _ckpt_optim_step if _ckpt_optim_step is not None else (current_step // _ckpt_accum)
         logger.info(
-            f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step}"
+            f"Checkpoint loaded from {args.resume_from_checkpoint}, starting from epoch {start_epoch} step {current_step} (optim_step={_resume_optim_step})"
         )
 
     if args.ema:
@@ -1306,7 +1385,8 @@ def train(args):
     _accum = getattr(args, 'grad_accum_steps', 1)
     _loss_accum = {"g_loss": 0.0, "rec_loss": 0.0, "kl_loss": 0.0, "nll_loss": 0.0,
                    "align_loss": 0.0, "total_loss": 0.0}
-    optimizer_step = 0
+    # [FIX] optim step 초기화: resume 시 ckpt 의 optim_step 사용 (= accum 변경 시 일관성). fresh 시 0.
+    optimizer_step = _resume_optim_step if args.resume_from_checkpoint and '_resume_optim_step' in dir() else 0
 
     if global_rank == 0:
         torch.cuda.empty_cache()
@@ -1400,7 +1480,7 @@ def train(args):
                         if getattr(args, 'no_fused_align', False):
                             # [NEW] Origin (kk4aiuyq) 식: run_teacher → run_student → compute_alignment_loss.
                             # fused 의 per-block detach + AlignGradInjector 대신 sum(grad-tracked losses).backward().
-                            features_ref, grid_ref, context, t_mod, freqs_ref = run_teacher_forward(
+                            features_ref, grid_ref, context, t_mod, freqs_ref, _teacher_noise = run_teacher_forward(
                                 dit=dit, dit_pipe=dit_pipe,
                                 inputs_align=inputs_align,
                                 scheduler=scheduler, timestep=timestep, t_tensor=t_tensor,
@@ -1428,6 +1508,8 @@ def train(args):
                                 rank=rank, precision=precision,
                                 retain_grads=(not args.no_log_grad and global_rank == 0 and current_step % args.log_steps == 0),
                                 logger=logger if global_rank == 0 else None,
+                                teacher_noise=_teacher_noise,
+                                use_teacher_subsample_noise=getattr(args, 'use_teacher_subsample_noise', False),
                             )
                             align_loss, align_per_layer = compute_alignment_loss(
                                 features_stu, features_ref,
@@ -1435,6 +1517,7 @@ def train(args):
                                 loss_type=args.align_loss_type,
                                 selected_layers=[int(x) for x in args.align_layers.split(",")] if args.align_layers != "all" else None,
                                 agg=args.align_agg,
+                                align_projections=getattr(model.module, 'align_projections', None),
                             )
                             # align_weight 적용 (compute_alignment_loss 는 weight 안 받음 — train loop 에서 scale)
                             align_loss = _aw_for_fused * align_loss
@@ -1459,6 +1542,8 @@ def train(args):
                                 batch=batch, _align_bs=_align_bs,
                                 retain_grads=(not args.no_log_grad and global_rank == 0 and current_step % args.log_steps == 0),
                                 logger=logger if global_rank == 0 else None,
+                                align_projections=getattr(model.module, 'align_projections', None),
+                                use_teacher_subsample_noise=getattr(args, 'use_teacher_subsample_noise', False),
                             )
 
                 # [NEW] 2-backward adaptive (legacy path) — mutually exclusive with _AdaptiveWeightingFn.
@@ -1470,14 +1555,42 @@ def train(args):
                 if (getattr(args, 'use_2backward_adaptive', False)
                         and args.align_weight > 0
                         and align_loss.item() > 0):
-                    _align_last_layer = model.module.vae.encoder.head[-1].weight
-                    _w_adaptive_2bwd, _w_raw_2bwd = compute_adaptive_weight_2bwd(
+                    _align_last_layer = model.module.vae.encoder.head[-1].weight  # AW.weight (= single-branch call 시 plain conv backward)
+                    _w_adaptive_2bwd, _w_raw_2bwd, _2bwd_rec_norm_main, _2bwd_align_norm_main = compute_adaptive_weight_2bwd(
                         g_loss, align_loss, _align_last_layer,
                         max_weight=getattr(args, 'adaptive_max_weight', 1e4),
                     )
                     total_loss = g_loss + args.align_weight * _w_adaptive_2bwd * align_loss
                 else:
                     total_loss = g_loss + align_loss
+
+                # [v26 disabled] 2bwd compare 비활성
+                _w_2bwd_compare = None
+                if False:
+                    _align_last_layer = model.module.vae.encoder.head[-1].weight  # AW.weight (= single-branch call 시 plain conv backward)
+                    _w_2bwd_raw = None
+                    _2bwd_rec_norm = None
+                    _2bwd_align_norm = None
+                    # [DIAG v25] allow_unused + 직접 fetch — true disconnect vs cast issue 식별
+                    if global_rank == 0:
+                        try:
+                            _test = torch.autograd.grad(align_loss, _align_last_layer, retain_graph=True, allow_unused=True)[0]
+                            _test_norm = 'None' if _test is None else f'{_test.norm().item():.6e}'
+                            logger.info(f"[DIAG] step {current_step} align→AW: grad={_test_norm}, is_leaf={_align_last_layer.is_leaf}, requires_grad={_align_last_layer.requires_grad}")
+                        except Exception as _de:
+                            import traceback
+                            logger.warning(f"[DIAG] step {current_step} align→AW raised: {type(_de).__name__}: {_de}\n{traceback.format_exc()}")
+                    try:
+                        _w_2bwd_compare, _w_2bwd_raw, _2bwd_rec_norm, _2bwd_align_norm = compute_adaptive_weight_2bwd(
+                            g_loss, align_loss, _align_last_layer,
+                            max_weight=getattr(args, 'adaptive_max_weight', 1e4),
+                        )
+                        if global_rank == 0 and current_step < 5:
+                            logger.info(f"[B-fix verify] 2bwd compare OK at step {current_step}: w={_w_2bwd_compare.item():.6f}")
+                    except Exception as _e:
+                        import traceback
+                        if global_rank == 0:
+                            logger.warning(f"[B-fix verify] 2bwd compare FAIL at step {current_step}: {type(_e).__name__}: {_e}\n{traceback.format_exc()}")
 
                 # [NEW - oliviaa/dit_align] gradient accumulation 지원
                 scaled_loss = scaler.scale(total_loss / _accum)
@@ -1489,17 +1602,127 @@ def train(args):
                     _mem_pre_bwd = torch.cuda.memory_allocated(rank) / 1e9
                     logger.info(f"[mem] step {current_step} pre-backward: allocated={_mem_pre_bwd:.2f}GB")
 
+                # [NEW v5 - oliviaa/B-fix verify] use_b_adaptive 시 K step 마다 의 retain_graph (= OOM 방지)
+                # 이전 (v2): 매 step 의 retain_graph → autograd.grad × 6 의 graph 의 누적 → 50GB/step ↑ → step 5 의 OOM (= v14 의 실제 cause)
+                # 해결: 250 step 의 1번 만 retain_graph + verify (= ckpt save 의 간격 과 같음)
+                # [v26 disabled] verify metric 제거 — 별도 run 으로 (B) vs 2backward 비교
+                _verify_now = False
+                _retain_for_verify = False
                 if _accum > 1 and not _is_accum_step:
                     with model.no_sync():
-                        scaled_loss.backward()
+                        scaled_loss.backward(retain_graph=_retain_for_verify)
                 else:
-                    scaled_loss.backward()
+                    scaled_loss.backward(retain_graph=_retain_for_verify)
 
                 # [DEBUG] memory after backward
                 if global_rank == 0:
                     _mem_post_bwd = torch.cuda.memory_allocated(rank) / 1e9
                     _mem_peak = torch.cuda.max_memory_allocated(rank) / 1e9
                     logger.info(f"[mem] step {current_step} post-backward: allocated={_mem_post_bwd:.2f}GB, peak={_mem_peak:.2f}GB")
+
+                # [v27] grad norm log (= 두 run 동등성 비교용, K=10 step 마다, rank0 only)
+                if global_rank == 0 and (current_step % 10 == 0):
+                    try:
+                        _wrap = model.module if hasattr(model, 'module') else model
+                        _vae = _wrap.vae
+                        def _gn(params):
+                            t = 0.0
+                            for p in params:
+                                if p.grad is not None:
+                                    t += p.grad.detach().float().norm().item() ** 2
+                            return t ** 0.5
+                        _enc_body = [p for n, p in _vae.encoder.named_parameters() if 'head.2' not in n]
+                        _enc_head = [_vae.encoder.head[-1].weight, _vae.encoder.head[-1].bias]
+                        _dec = list(_vae.decoder.parameters())
+                        _lora = [p for n, p in dit.named_parameters() if 'lora_' in n.lower()]
+                        _patch = list(student_patchify.parameters()) if student_patchify is not None else []
+                        wandb.log({
+                            "gnorm/encoder_body":    _gn(_enc_body),
+                            "gnorm/encoder_head":    _gn(_enc_head),
+                            "gnorm/decoder":         _gn(_dec),
+                            "gnorm/dit_lora":        _gn(_lora),
+                            "gnorm/student_patchify": _gn(_patch),
+                        }, step=optimizer_step)
+                    except Exception as _ge:
+                        if current_step < 5:
+                            logger.warning(f"[gnorm] fail: {_ge}")
+
+                # [NEW v5 - oliviaa/B-fix verify] K step 마다 의 verify (= OOM 방지)
+                # 매 step 의 verify (= autograd.grad × 6 + retain_graph) → 메모리 누적 → step 5 의 OOM (= v14)
+                # 해결: _verify_now (= 250 step 의 1번) 일 때 만 verify block
+                if _verify_now:
+                    try:
+                        _wrapper = model.module if hasattr(model, 'module') else model
+                        _vae = _wrapper.vae
+                        _opt_step = optimizer_step
+
+                        def _gnorm(params):
+                            total = 0.0
+                            cnt = 0
+                            for p in params:
+                                if p.grad is not None:
+                                    total += p.grad.detach().float().norm().item() ** 2
+                                    cnt += 1
+                            return (total ** 0.5) if cnt > 0 else 0.0
+
+                        _enc_body = [p for n, p in _vae.encoder.named_parameters() if 'head.2' not in n]
+                        _enc_head = [_vae.encoder.head[-1].weight, _vae.encoder.head[-1].bias]
+                        _dec = list(_vae.decoder.parameters())
+                        _lora = [p for n, p in dit.named_parameters() if 'lora_' in n.lower()]
+                        _patch = list(student_patchify.parameters()) if student_patchify is not None else []
+
+                        # 1. grad norm log = rank0 only (= 단 local norm, all_reduce X)
+                        if global_rank == 0:
+                            wandb.log({
+                                "verify/grad_norm/encoder_body":    _gnorm(_enc_body),
+                                "verify/grad_norm/encoder_head_last": _gnorm(_enc_head),
+                                "verify/grad_norm/decoder":         _gnorm(_dec),
+                                "verify/grad_norm/dit_lora":        _gnorm(_lora),
+                                "verify/grad_norm/student_patchify": _gnorm(_patch),
+                            }, step=_opt_step)
+
+                        # 2. (B) vs 2backward 의 직접 grad diff
+                        # 모든 rank 가 autograd.grad 호출 (= 우리 _AdaptiveWeightedConv3dFn.backward 의 dist.all_reduce 의 모든 rank 의 호출 의 보장)
+                        # log / 비교 는 rank0 만
+                        if _w_2bwd_compare is not None:
+                            _c = float(_w_2bwd_compare.item())
+
+                            def _grad_diff(params_to_compare, label):
+                                _trainable = [p for p in params_to_compare if p.requires_grad]
+                                if not _trainable:
+                                    return
+                                # 모든 rank 가 호출 (= DDP collective sync)
+                                _rec_g = torch.autograd.grad(g_loss, _trainable, retain_graph=True, allow_unused=True)
+                                _align_g = torch.autograd.grad(align_loss, _trainable, retain_graph=True, allow_unused=True)
+                                if global_rank != 0:
+                                    return
+                                _diff_sq, _norm_sq, _max_rel = 0.0, 0.0, 0.0
+                                for _p, _gr, _ga in zip(_trainable, _rec_g, _align_g):
+                                    if _p.grad is None or _gr is None or _ga is None:
+                                        continue
+                                    _g_2bwd = _gr + _c * _ga
+                                    _g_b = _p.grad
+                                    _d = (_g_b - _g_2bwd).norm().item()
+                                    _n = _g_2bwd.norm().item()
+                                    _diff_sq += _d ** 2
+                                    _norm_sq += _n ** 2
+                                    if _n > 1e-10:
+                                        _max_rel = max(_max_rel, _d / _n)
+                                _rel = (_diff_sq ** 0.5) / max(_norm_sq ** 0.5, 1e-10)
+                                wandb.log({
+                                    f"verify/{label}_rel_diff": _rel,
+                                    f"verify/{label}_max_rel":  _max_rel,
+                                }, step=_opt_step)
+
+                            # 1. encoder.head[-1] = 우리 manual 의 직접 grad (★ 가장 critical)
+                            _grad_diff([_vae.encoder.head[-1].weight, _vae.encoder.head[-1].bias], "encoder_head_last")
+                            # 2. encoder body = 우리 grad_x 의 chain
+                            _grad_diff(_enc_body, "encoder_body")
+                            # 3. decoder = sanity check (= 우리 manual 와 무관)
+                            _grad_diff(_dec, "decoder")
+                    except Exception as _e:
+                        if current_step < 5 and global_rank == 0:
+                            logger.warning(f"[B-fix verify] fail: {_e}")
 
                 # accumulation 완료 시에만 optimizer step
                 if _is_accum_step:
@@ -1621,12 +1844,74 @@ def train(args):
                             _w_log = float(_w_adaptive_2bwd.item() if hasattr(_w_adaptive_2bwd, 'item') else _w_adaptive_2bwd)
                             if _w_raw_2bwd is not None:
                                 wandb.log({"train/adaptive_weight_w_raw": float(_w_raw_2bwd.item())}, step=optimizer_step)
+                        elif getattr(args, 'use_b_adaptive', False):
+                            # [NEW - oliviaa/B-fix verify] (B) 의 ratio = _AdaptiveWeightedConv3dFn._last_c
+                            try:
+                                from adaptive_weighted_causal_conv_3d import _AdaptiveWeightedConv3dFn
+                                _w_log = float(_AdaptiveWeightedConv3dFn._last_c.item())
+                            except (ImportError, AttributeError):
+                                _w_log = 1.0
                         elif args.align_adaptive_weight and getattr(_AdaptiveWeightingFn, '_last_c', None) is not None:
                             _w_log = float(_AdaptiveWeightingFn._last_c.item())
                         else:
                             _w_log = 1.0
                         wandb.log({"train/adaptive_weight_w": _w_log}, step=optimizer_step)
                         wandb.log({"train/align_loss_weighted": args.align_weight * _w_log * _al}, step=optimizer_step)
+
+                        # [v27c] 두 run 비교용 — 분자/분모 + W norm log
+                        try:
+                            _wrap2 = model.module if hasattr(model, 'module') else model
+                            _hwl = _wrap2.vae.encoder.head[-1].weight
+                            wandb.log({"weight/head_last_norm": _hwl.detach().float().norm().item()}, step=optimizer_step)
+                        except Exception:
+                            pass
+                        if getattr(args, 'use_b_adaptive', False):
+                            try:
+                                from adaptive_weighted_causal_conv_3d import _AdaptiveWeightedConv3dFn as _Fn
+                                if getattr(_Fn, '_last_grad_W_main_norm', None) is not None:
+                                    wandb.log({
+                                        "ratio/rec_grad_W_norm":   float(_Fn._last_grad_W_main_norm.item()),
+                                        "ratio/align_grad_W_norm": float(_Fn._last_grad_W_adv_norm.item()),
+                                    }, step=optimizer_step)
+                            except Exception:
+                                pass
+                        elif getattr(args, 'use_2backward_adaptive', False) and '_2bwd_rec_norm_main' in dir() and _2bwd_rec_norm_main is not None:
+                            wandb.log({
+                                "ratio/rec_grad_W_norm":   float(_2bwd_rec_norm_main.item()),
+                                "ratio/align_grad_W_norm": float(_2bwd_align_norm_main.item()),
+                            }, step=optimizer_step)
+
+                        # [NEW - oliviaa/B-fix verify] (B) 학습 의 case — 2bwd 의 ratio 도 log + diff 비교
+                        if getattr(args, 'use_b_adaptive', False) and _w_2bwd_compare is not None:
+                            _w_2bwd_val = float(_w_2bwd_compare.item() if hasattr(_w_2bwd_compare, 'item') else _w_2bwd_compare)
+                            _rel_diff = abs(_w_log - _w_2bwd_val) / max(_w_2bwd_val, 1e-10)
+                            _log_d = {
+                                "train/adaptive_weight_2bwd_compare": _w_2bwd_val,
+                                "train/adaptive_weight_b_vs_2bwd_diff_abs": abs(_w_log - _w_2bwd_val),
+                                "train/adaptive_weight_b_vs_2bwd_diff_rel": _rel_diff,
+                            }
+                            # raw ratio (= clamp 전) log — saturation 영향 제외 한 진짜 비교
+                            if _w_2bwd_raw is not None:
+                                _w_2bwd_raw_val = float(_w_2bwd_raw.item())
+                                _log_d["train/adaptive_weight_2bwd_raw"] = _w_2bwd_raw_val
+                            from adaptive_weighted_causal_conv_3d import _AdaptiveWeightedConv3dFn as _Fn
+                            if getattr(_Fn, '_last_c_raw', None) is not None:
+                                _w_b_raw_val = float(_Fn._last_c_raw.item())
+                                _log_d["train/adaptive_weight_b_raw"] = _w_b_raw_val
+                                if _w_2bwd_raw is not None:
+                                    _log_d["train/adaptive_weight_raw_diff_rel"] = abs(_w_b_raw_val - _w_2bwd_raw_val) / max(_w_2bwd_raw_val, 1e-10)
+                            # [DEBUG v23] (B) AW backward 의 intermediate norm + 2backward norm 비교
+                            if getattr(_Fn, '_last_grad_W_main_norm', None) is not None:
+                                _log_d["debug/b_grad_W_main_norm"] = float(_Fn._last_grad_W_main_norm.item())
+                                _log_d["debug/b_grad_W_adv_norm"] = float(_Fn._last_grad_W_adv_norm.item())
+                                _log_d["debug/b_grad_y_main_norm"] = float(_Fn._last_grad_y_main_norm.item())
+                                _log_d["debug/b_grad_y_adv_norm"] = float(_Fn._last_grad_y_adv_norm.item())
+                            if _2bwd_rec_norm is not None:
+                                _log_d["debug/2bwd_rec_norm"] = float(_2bwd_rec_norm.item())
+                                _log_d["debug/2bwd_align_norm"] = float(_2bwd_align_norm.item())
+                            wandb.log(_log_d, step=optimizer_step)
+
+                    # [REMOVED v2 - oliviaa/B-fix verify] grad norm log 의 위치 이동 → backward 직후 (= line ~1547)
                     for layer_name, layer_loss in align_per_layer.items():
                         wandb.log({f"train/align_layer/{layer_name}": layer_loss.item()}, step=optimizer_step)
 
@@ -1685,9 +1970,11 @@ def train(args):
                         wandb.log({"train/discriminator_loss": d_loss.item()}, step=optimizer_step)
 
             update_bar(bar)
+            _was_accum_step = (current_step + 1) % _accum == 0  # backward 후 increment 전 의 _is_accum_step 과 동일
             current_step += 1
-            # optimizer_step: accum=1 이면 current_step 과 동일, accum>1 이면 current_step // accum
-            optimizer_step = current_step // _accum
+            # [FIX] optimizer_step 의 의 의 의 의 의 의 직접 increment (= ckpt 의 optim_step 복원 후 누적). accum 변경 시 일관성.
+            if _was_accum_step:
+                optimizer_step += 1
 
             def valid_model(model, name="", dataloader=None):
                 set_eval(modules_to_train)
@@ -1747,7 +2034,7 @@ def train(args):
                         )
                     logger.info(f"{name} Validation done.")
 
-            if args.eval_video_path is not None and (optimizer_step % args.eval_steps == 0 or optimizer_step == 1):
+            if _is_accum_step and args.eval_video_path is not None and (optimizer_step % args.eval_steps == 0 or optimizer_step == 1):
                 if global_rank == 0:
                     logger.info("Starting validation...")
                 valid_model(model)
@@ -1791,6 +2078,8 @@ def train(args):
                          for n, p in dit.named_parameters() if 'lora_' in n}
                         if getattr(args, 'use_lora', False) else {}
                     ),
+                    optimizer_step=optimizer_step,  # accum 변경 시 wandb step 일관성 유지
+                    grad_accum_steps=_accum,
                 )
                 logger.info(f"Checkpoint has been saved to `{file_path}`.")
 
@@ -1812,6 +2101,8 @@ def main():
         "--max_steps", type=int, default=None, help="number of epochs to train"
     )
     parser.add_argument("--save_ckpt_step", type=int, default=1000, help="")
+    parser.add_argument("--resume_ckpt_grad_accum", type=int, default=None,
+                        help="resume 시 ckpt 의 grad_accum_steps metadata 없을 때 사용 (= 옛 ckpt 호환)")
     parser.add_argument("--ckpt_dir", type=str, default="./results/", help="")
     parser.add_argument(
         "--batch_size", type=int, default=1, help="batch size for training"
@@ -1965,6 +2256,12 @@ def main():
     parser.add_argument("--adaptive_max_weight", type=float, default=1e4,
                         help="upper clamp for adaptive weight ratio (applies to both single-bwd and 2-bwd modes). "
                              "0 or negative = no clamp.")
+    # [NEW - oliviaa/B-fix] (B) 식 — encoder.head[-1] 의 conv forward 의 분기 + weight gradient ratio
+    parser.add_argument("--use_b_adaptive", action="store_true", default=False,
+                        help="(B) 식 — encoder.head[-1] 자체 를 AdaptiveWeightedCausalConv3d 으로 교체. "
+                             "single backward path 의 weight gradient ratio mechanism (= 정확 weight ratio). "
+                             "use_2backward_adaptive 와 mutually exclusive. 기존 activation gradient ratio "
+                             "(= _AdaptiveWeightingFn.apply) 대체.")
     parser.add_argument("--log_adaptive_weight", action="store_true",
                         help="wandb log adaptive weight w (raw ratio) + properly-weighted train/align_loss_weighted. "
                              "Default off (avoids per-step .item() cpu sync).")
@@ -2040,6 +2337,16 @@ def main():
                         help="gradient checkpoint 적용할 block 수 (앞에서부터). 40=전부, 15=앞쪽 15개만")
     parser.add_argument("--align_num_blocks", type=int, default=40,
                         help="alignment에 사용할 DiT block 수. 40=전부, 20=절반. 줄이면 activation 메모리 절약")
+    # [NEW - oliviaa] block 별 학습 가능 projection layer (trilinear 후 residual)
+    parser.add_argument("--use_align_projection", action="store_true", default=False,
+                        help="trilinear 후 block 별 conv3d residual projection (zero init)")
+    parser.add_argument("--align_proj_dim", type=int, default=5120,
+                        help="projection conv 의 in/out channel (= DiT hidden_size)")
+    parser.add_argument("--align_projection_init", type=str, default="zero", choices=["zero", "random"],
+                        help="zero=trilinear 그대로 시작, random=Kaiming init")
+    # [NEW - oliviaa] teacher noise 의 nearest subsample 으로 student noise 생성 (= correlated noise)
+    parser.add_argument("--use_teacher_subsample_noise", action="store_true", default=False,
+                        help="student noise 를 teacher noise 의 nearest spatial subsample 으로 만듦")
     parser.add_argument("--align_block_stride", type=int, default=1,
                         help="block 선택 간격. 1=연속(앞쪽 N개), 2=짝수번째(0,2,4,...). stride>1이면 전체 depth 커버")
     parser.add_argument("--align_batch_size", type=int, default=0,

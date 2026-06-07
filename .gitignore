@@ -16,3 +16,6 @@ external/DiffSynth-Studio/
 task*.txt
 panda70m_train.txt
 panda70m_eval.txt
+logs/
+*.log
+*.png

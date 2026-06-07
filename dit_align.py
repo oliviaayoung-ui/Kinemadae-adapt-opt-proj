@@ -179,7 +179,8 @@ def create_student_patchify(dit, in_channels=None, init_mode='zero', mask_init='
 # ---------------------------------------------------------------------------
 
 def compute_alignment_loss(features_stu, features_ref, grid_stu, grid_ref,
-                            loss_type='mse', selected_layers=None, agg='sum'):
+                            loss_type='mse', selected_layers=None, agg='sum',
+                            align_projections=None):
     """[NEW - oliviaa/dit_align] Per-layer DiT feature alignment loss.
     features_stu[l] 을 spatial reshape → trilinear upsample → features_ref[l] 과 비교.
 
@@ -203,9 +204,12 @@ def compute_alignment_loss(features_stu, features_ref, grid_stu, grid_ref,
             continue
         B, _, D = feat_s.shape
         feat_s_3d = feat_s.reshape(B, f_s, h_s, w_s, D).permute(0, 4, 1, 2, 3)
-        feat_s_up = F.interpolate(feat_s_3d.float(), size=(f_r, h_r, w_r),
-                                   mode='trilinear', align_corners=False)
-        feat_s_up = feat_s_up.permute(0, 2, 3, 4, 1).reshape(B, -1, D)
+        feat_s_up_3d = F.interpolate(feat_s_3d.float(), size=(f_r, h_r, w_r),
+                                      mode='trilinear', align_corners=False)
+        # [NEW - oliviaa] block 별 residual projection (zero init → 시작 시 trilinear 결과 그대로)
+        if align_projections is not None and l < len(align_projections):
+            feat_s_up_3d = feat_s_up_3d + align_projections[l](feat_s_up_3d)
+        feat_s_up = feat_s_up_3d.permute(0, 2, 3, 4, 1).reshape(B, -1, D)
         # features_ref가 CPU에 있을 수 있으므로 GPU로 이동
         feat_r_gpu = feat_r.to(feat_s.device) if feat_r.device != feat_s.device else feat_r
         if loss_type == 'mse':
@@ -342,7 +346,7 @@ def run_teacher_forward(
             _mem = torch.cuda.memory_allocated(rank) / 1e9
             logger.info(f"[mem] after teacher forward: allocated={_mem:.2f}GB")
 
-    return features_ref, (f_r, h_r, w_r), context, t_mod, freqs_ref
+    return features_ref, (f_r, h_r, w_r), context, t_mod, freqs_ref, noise_ref
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +359,7 @@ def run_student_forward(
     _align_block_set, _dit_offload, _use_gc, grad_checkpoint_num_blocks,
     align_after_patchify, rank, precision,
     retain_grads=False, logger=None,
+    teacher_noise=None, use_teacher_subsample_noise=False,
 ):
     """Branch 2: geoprior z_cat → noisy → student patchify → blocks.
 
@@ -372,7 +377,11 @@ def run_student_forward(
         noisy_cat             : noisy z_cat (retained grad if retain_grads)
         x_stu_post_patchify   : patchify output (retained grad if retain_grads)
     """
-    noise_cat = torch.randn_like(z_cat_align)
+    # [NEW - oliviaa] teacher noise 의 nearest spatial subsample (= i.i.d. N(0,1) 유지, correlation 추가)
+    if use_teacher_subsample_noise and teacher_noise is not None:
+        noise_cat = F.interpolate(teacher_noise.float(), size=z_cat_align.shape[2:], mode='nearest').to(z_cat_align.dtype)
+    else:
+        noise_cat = torch.randn_like(z_cat_align)
     noisy_cat = scheduler.add_noise(z_cat_align, noise_cat, timestep)
     if retain_grads:
         noisy_cat.retain_grad()
@@ -386,7 +395,13 @@ def run_student_forward(
         # image conditioning: encode first frame with geoprior VAE → 48ch
         img_input = torch.zeros_like(inputs_align)
         img_input[:, :, 0:1] = inputs_align[:, :, 0:1]
-        mu_img, _ = model_module.vae.encode(img_input, scale=None)
+        # [NEW - oliviaa/B-fix] use_b_adaptive=True 시 encode 의 return 가 ((mu, log_var), (mu_adv, log_var_adv))
+        # image conditioning 은 align loss 와 무관 (= no_grad) — main branch 만 사용
+        _enc_result = model_module.vae.encode(img_input, scale=None)
+        if isinstance(_enc_result[0], tuple):
+            mu_img, _ = _enc_result[0]    # main branch
+        else:
+            mu_img, _ = _enc_result
         # [NEW - oliviaa] 변종 B: image_z_main도 정규화 (alignment 경로 일관성)
         mu_img = model_module._norm_zmain(mu_img)
         z_prior_img = model_module.vae._encode_prior(img_input)
@@ -628,8 +643,11 @@ class AlignGradInjector(torch.autograd.Function):
         return grad_out + g_align, None
 
 
-def _align_loss_single(feat_s, feat_r, grid_stu, grid_ref, loss_type):
-    """Single-layer alignment loss with optional trilinear upsample."""
+def _align_loss_single(feat_s, feat_r, grid_stu, grid_ref, loss_type, align_proj=None):
+    """Single-layer alignment loss with optional trilinear upsample + residual projection.
+
+    align_proj: nn.Conv3d (zero init) for residual refinement after trilinear. If None, no projection.
+    """
     f_s, h_s, w_s = grid_stu
     f_r, h_r, w_r = grid_ref
     B, _, D = feat_s.shape
@@ -637,6 +655,9 @@ def _align_loss_single(feat_s, feat_r, grid_stu, grid_ref, loss_type):
     if (f_s, h_s, w_s) != (f_r, h_r, w_r):
         feat_s_3d = F.interpolate(feat_s_3d, size=(f_r, h_r, w_r),
                                    mode='trilinear', align_corners=False)
+    # [NEW - oliviaa] block 별 residual projection (zero init → 시작 시 trilinear 결과 그대로)
+    if align_proj is not None:
+        feat_s_3d = feat_s_3d + align_proj(feat_s_3d)
     feat_s_up = feat_s_3d.permute(0, 2, 3, 4, 1).reshape(B, -1, D)
     feat_r = (feat_r.to(feat_s.device) if feat_r.device != feat_s.device else feat_r).float()
     if loss_type == 'mse':
@@ -661,6 +682,8 @@ def fused_dit_align_forward(
     _use_caption=False, caption_map=None,
     batch=None, _align_bs=1,
     retain_grads=False, logger=None,
+    align_projections=None,
+    use_teacher_subsample_noise=False,
 ):
     """Fused teacher+student DiT forward with per-block alignment gradient injection.
 
@@ -757,7 +780,11 @@ def fused_dit_align_forward(
         ], dim=-1).reshape(f_r * h_r * w_r, 1, -1).to(rank)
 
     # ── Student pre-block setup ──────────────────────────────────────────────
-    noise_cat = torch.randn_like(z_cat_align)
+    # [NEW - oliviaa] teacher noise 의 nearest spatial subsample (= i.i.d. N(0,1) 유지)
+    if use_teacher_subsample_noise:
+        noise_cat = F.interpolate(noise_ref.float(), size=z_cat_align.shape[2:], mode='nearest').to(z_cat_align.dtype)
+    else:
+        noise_cat = torch.randn_like(z_cat_align)
     noisy_cat = scheduler.add_noise(z_cat_align, noise_cat, timestep)
     if retain_grads:
         noisy_cat.retain_grad()
@@ -769,7 +796,13 @@ def fused_dit_align_forward(
     with torch.no_grad():
         img_input = torch.zeros_like(inputs_align)
         img_input[:, :, 0:1] = inputs_align[:, :, 0:1]
-        mu_img, _ = model_module.vae.encode(img_input, scale=None)
+        # [NEW - oliviaa/B-fix] use_b_adaptive=True 시 encode 의 return 가 ((mu, log_var), (mu_adv, log_var_adv))
+        # image conditioning 은 align loss 와 무관 (= no_grad) — main branch 만 사용
+        _enc_result = model_module.vae.encode(img_input, scale=None)
+        if isinstance(_enc_result[0], tuple):
+            mu_img, _ = _enc_result[0]    # main branch
+        else:
+            mu_img, _ = _enc_result
         mu_img = model_module._norm_zmain(mu_img)
         z_prior_img = model_module.vae._encode_prior(img_input)
         z_prior_img = model_module._norm_zprior(z_prior_img)
@@ -819,7 +852,8 @@ def fused_dit_align_forward(
     if align_after_patchify:
         if selected_layers is None or l in selected_layers:
             feat_s_det = x_stu.detach().requires_grad_(True)
-            loss_l = _align_loss_single(feat_s_det, x_ref, grid_stu, grid_ref, loss_type)
+            _ap = align_projections[l] if (align_projections is not None and l < len(align_projections)) else None
+            loss_l = _align_loss_single(feat_s_det, x_ref, grid_stu, grid_ref, loss_type, align_proj=_ap)
             g = torch.autograd.grad(align_weight * loss_l, feat_s_det)[0]
             x_stu = AlignGradInjector.apply(x_stu, g)
             per_layer['patch'] = loss_l.detach()
@@ -853,7 +887,8 @@ def fused_dit_align_forward(
         # x_ref itself is freed on the next iteration when the variable is reassigned.
         if selected_layers is None or l in selected_layers:
             feat_s_det = x_stu.detach().requires_grad_(True)
-            loss_l = _align_loss_single(feat_s_det, x_ref, grid_stu, grid_ref, loss_type)
+            _ap = align_projections[l] if (align_projections is not None and l < len(align_projections)) else None
+            loss_l = _align_loss_single(feat_s_det, x_ref, grid_stu, grid_ref, loss_type, align_proj=_ap)
             g = torch.autograd.grad(align_weight * loss_l, feat_s_det)[0]
             x_stu = AlignGradInjector.apply(x_stu, g)
             per_layer[f'b{bi}'] = loss_l.detach()
