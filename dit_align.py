@@ -17,10 +17,37 @@ import os
 import sys
 
 
+@contextlib.contextmanager
 def _maybe_disable_lora(dit):
     """LoRA inject 된 DiT 의 teacher forward 시 adapter off → pretrained behavior.
-    inject 안 된 경우 nullcontext 반환."""
-    return dit.disable_adapter() if hasattr(dit, 'disable_adapter') else contextlib.nullcontext()
+
+    [FIX] inject_adapter_in_model 로 주입한 모델은 PeftModel 이 아니라 disable_adapter() 가 없음
+    (= hasattr False → 기존엔 nullcontext 로 빠져 teacher LoRA 가 실제로 안 꺼지던 silent bug).
+    BaseTunerLayer.enable_adapters 를 직접 토글하여 진짜로 끔.
+    - layers 는 dit 에 1회 캐싱 → block loop 안에서 매번 호출돼도 dit.modules() 재순회 X (속도).
+    - 이전 상태 저장/복원 (nested-safe). teacher_frozen_pretrained 가 이미 전부 off 한 상태면
+      no-op 으로 빠져 토글 비용 0."""
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        if not hasattr(dit, '_lora_tuner_layers'):
+            dit._lora_tuner_layers = [m for m in dit.modules() if isinstance(m, BaseTunerLayer)]
+        layers = dit._lora_tuner_layers
+    except Exception:
+        layers = []
+    if not layers:
+        yield
+        return
+    prev_enabled = [not getattr(m, '_disable_adapters', False) for m in layers]
+    if not any(prev_enabled):  # 이미 전부 off (e.g. teacher_frozen) → no-op
+        yield
+        return
+    for m in layers:
+        m.enable_adapters(False)
+    try:
+        yield
+    finally:
+        for m, e in zip(layers, prev_enabled):
+            m.enable_adapters(e)
 
 # Ensure external libraries are on the path (same defaults as the training file;
 # override via KINEMADAE_DIFFSYNTH_PATH / KINEMADAE_PROBING_PATH env vars).
@@ -33,6 +60,7 @@ for _env, _default in (
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +75,47 @@ from dit_feature_extractor import (
 )
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d, gradient_checkpoint_forward
+from diffsynth.models.wan_video_dit import Head as WanHead
+
+
+# ---------------------------------------------------------------------------
+# [NEW - oliviaa] DaVaeHead — stage2 (rm57nmln) 의 DaVaeHead 와 동일.
+# z_cat = [z_main(z_dim) | z_prior(prior_z_dim)] 의 velocity 를 각각 예측 후 concat.
+#   head_main  : WanHead(dim → z_dim),      final linear zero-init (= 시작 기여 0, 학습)
+#   head_prior : WanHead(dim → prior_z_dim), pretrained dit.head copy-init (= z_prior 표준 동작)
+# diffusion loss 전용 (align forward 는 head 를 안 씀 → dit.head 는 안 건드림).
+# ---------------------------------------------------------------------------
+class DaVaeHead(nn.Module):
+    def __init__(self, head_main, head_prior):
+        super().__init__()
+        self.head_main = head_main
+        self.head_prior = head_prior
+
+    def forward(self, x, t_mod):
+        # WanHead.forward 의 else 분기가 batch patch 됨 (diffsynth flow_match/wan_video_dit) → t_mod (B,dim) 직접 OK.
+        out_main = self.head_main(x, t_mod)    # (B, seq, z_dim * patch_prod)
+        out_prior = self.head_prior(x, t_mod)  # (B, seq, prior_z_dim * patch_prod)
+        return torch.cat([out_main, out_prior], dim=-1)
+
+
+def build_davae_head(dit, z_dim, prior_z_dim):
+    """stage2 build (train_dit.py:634-646) 와 동일 init."""
+    dim = dit.dim
+    patch_size = dit.patch_size
+    eps = dit.head.norm.eps if hasattr(dit.head, 'norm') else 1e-6
+    # head_prior = pretrained dit.head copy
+    head_prior = WanHead(dim, prior_z_dim, patch_size, eps)
+    head_prior.norm.load_state_dict(dit.head.norm.state_dict())
+    head_prior.head.weight.data.copy_(dit.head.head.weight.data[:prior_z_dim * math.prod(patch_size)])
+    head_prior.head.bias.data.copy_(dit.head.head.bias.data[:prior_z_dim * math.prod(patch_size)])
+    head_prior.modulation.data.copy_(dit.head.modulation.data)
+    # head_main = zero-init (norm/modulation 은 dit.head 복사)
+    head_main = WanHead(dim, z_dim, patch_size, eps)
+    head_main.norm.load_state_dict(dit.head.norm.state_dict())
+    head_main.modulation.data.copy_(dit.head.modulation.data)
+    nn.init.zeros_(head_main.head.weight)
+    nn.init.zeros_(head_main.head.bias)
+    return DaVaeHead(head_main, head_prior)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +301,48 @@ def compute_alignment_loss(features_stu, features_ref, grid_stu, grid_ref,
 
 
 # ---------------------------------------------------------------------------
+# Teacher noise subsample helper
+# ---------------------------------------------------------------------------
+
+def build_student_noise_cat(z_cat_align, teacher_noise=None, mode='off'):
+    """Build student noise for noisy_z_cat. Supports 4 modes.
+
+    z_cat_align layout: [noisy_z_main(z_dim) | noisy_z_prior(prior_z_dim)].
+    teacher_noise channel = z_ref channel (= z_dim).
+
+    mode:
+      'off'     : both random (= 기존 동작, teacher correlation 없음)
+      'z_main'  : (A) z_main = teacher subsample, z_prior = new randn
+      'z_prior' : (C) z_main = new randn, z_prior = teacher subsample (= default)
+      'both'    : (B) z_main + z_prior 둘 다 같은 teacher subsample
+                  (= channel correlation 1, train/test mismatch 위험)
+    """
+    if mode == 'off' or teacher_noise is None:
+        return torch.randn_like(z_cat_align)
+
+    # Spatial nearest subsample (teacher H_t → student H_s, e.g. 2x downsample).
+    teacher_sub = F.interpolate(teacher_noise.float(),
+                                size=z_cat_align.shape[2:],
+                                mode='nearest').to(z_cat_align.dtype)
+    teacher_ch = teacher_sub.shape[1]      # = z_dim (e.g. 16)
+    total_ch = z_cat_align.shape[1]        # = z_dim + prior_z_dim (e.g. 32)
+
+    noise_cat = torch.randn_like(z_cat_align)
+    if mode == 'z_main':
+        noise_cat[:, :teacher_ch] = teacher_sub
+    elif mode == 'z_prior':
+        end = min(teacher_ch * 2, total_ch)
+        noise_cat[:, teacher_ch:end] = teacher_sub[:, :end - teacher_ch]
+    elif mode == 'both':
+        noise_cat[:, :teacher_ch] = teacher_sub
+        end = min(teacher_ch * 2, total_ch)
+        noise_cat[:, teacher_ch:end] = teacher_sub[:, :end - teacher_ch]
+    else:
+        raise ValueError(f"Unknown teacher_subsample_noise_mode: {mode}")
+    return noise_cat
+
+
+# ---------------------------------------------------------------------------
 # Teacher forward pass
 # ---------------------------------------------------------------------------
 
@@ -359,7 +470,7 @@ def run_student_forward(
     _align_block_set, _dit_offload, _use_gc, grad_checkpoint_num_blocks,
     align_after_patchify, rank, precision,
     retain_grads=False, logger=None,
-    teacher_noise=None, use_teacher_subsample_noise=False,
+    teacher_noise=None, teacher_subsample_noise_mode='off',
 ):
     """Branch 2: geoprior z_cat → noisy → student patchify → blocks.
 
@@ -370,6 +481,9 @@ def run_student_forward(
         model_module          : unwrapped model (model.module) for VAE encode
         retain_grads          : call .retain_grad() on noisy_cat and patchify
                                 output (for gradient logging)
+        teacher_noise         : noise_ref from run_teacher_forward (= z_ref shape)
+        teacher_subsample_noise_mode : 'off' | 'z_main' | 'z_prior' | 'both'
+                                See build_student_noise_cat() for details.
 
     Returns:
         features_stu          : list of (B, seq_stu, D) grad-tracked tensors
@@ -377,11 +491,8 @@ def run_student_forward(
         noisy_cat             : noisy z_cat (retained grad if retain_grads)
         x_stu_post_patchify   : patchify output (retained grad if retain_grads)
     """
-    # [NEW - oliviaa] teacher noise 의 nearest spatial subsample (= i.i.d. N(0,1) 유지, correlation 추가)
-    if use_teacher_subsample_noise and teacher_noise is not None:
-        noise_cat = F.interpolate(teacher_noise.float(), size=z_cat_align.shape[2:], mode='nearest').to(z_cat_align.dtype)
-    else:
-        noise_cat = torch.randn_like(z_cat_align)
+    noise_cat = build_student_noise_cat(z_cat_align, teacher_noise=teacher_noise,
+                                        mode=teacher_subsample_noise_mode)
     noisy_cat = scheduler.add_noise(z_cat_align, noise_cat, timestep)
     if retain_grads:
         noisy_cat.retain_grad()
@@ -470,6 +581,138 @@ def run_student_forward(
         logger.info(f"[mem] after student forward: allocated={_mem:.2f}GB")
 
     return features_stu, (f_s, h_s, w_s), noisy_cat, x_stu_post_patchify
+
+
+# ---------------------------------------------------------------------------
+# [NEW - oliviaa] Diffusion (flow matching) forward — REPA-E 방식 (z.detach())
+# stage2 (rm57nmln) KinemaDAEFlowMatchSFTLoss 와 동일한 flow match loss.
+# z_cat 을 detach 하여 diffusion gradient 가 VAE 로 안 흐름 (REPA-E train_repae.py:418).
+# gradient: student_patchify + DiT (LoRA/block) + davae_head 만 (teacher 무관).
+# ---------------------------------------------------------------------------
+def run_student_diffusion_forward(
+    student_patchify, dit, davae_head, inputs_align, z_cat_align,
+    scheduler, context, model_module, mask_mode,
+    _align_block_set, _dit_offload, _use_gc, grad_checkpoint_num_blocks,
+    rank, precision, z_dim, prior_z_dim,
+    min_timestep_boundary=0.0, max_timestep_boundary=1.0,
+    logger=None,
+):
+    """Branch 3: z_cat.detach() → noisy → student DiT → davae_head → flow match loss.
+
+    Returns:
+        loss_diff (scalar), loss_z_main (float), loss_z_prior (float)
+    """
+    # z detach → VAE 로 grad 차단 (REPA-E)
+    z_diff = z_cat_align.detach()
+    B_align = z_diff.shape[0]
+
+    # ── stage2 식 per-sample timestep (randint over scheduler.timesteps) ──
+    n_steps = len(scheduler.timesteps)
+    min_b = int(min_timestep_boundary * n_steps)
+    max_b = max(min_b + 1, int(max_timestep_boundary * n_steps))
+    timestep_id = torch.randint(min_b, max_b, (B_align,))
+    timestep = scheduler.timesteps[timestep_id].to(dtype=precision, device=rank)  # (B,)
+
+    noise_d = torch.randn_like(z_diff)
+    # scheduler.add_noise / training_target 이 batch patch 됨 → per-sample timestep 그대로 사용 (= stage2 동일)
+    noisy_d = scheduler.add_noise(z_diff, noise_d, timestep)   # (1-σ)z + σ·noise
+    target = scheduler.training_target(z_diff, noise_d, timestep)  # noise - z (velocity)
+
+    # ── image conditioning + mask (= run_student_forward 와 동일, no_grad) ──
+    num_frames = inputs_align.shape[2]
+    _, _, T_lat, H_lat, W_lat = z_diff.shape
+    tf_stu = 8
+    with torch.no_grad():
+        img_input = torch.zeros_like(inputs_align)
+        img_input[:, :, 0:1] = inputs_align[:, :, 0:1]
+        _enc_result = model_module.vae.encode(img_input, scale=None)
+        if isinstance(_enc_result[0], tuple):
+            mu_img, _ = _enc_result[0]
+        else:
+            mu_img, _ = _enc_result
+        mu_img = model_module._norm_zmain(mu_img)
+        z_prior_img = model_module.vae._encode_prior(img_input)
+        z_prior_img = model_module._norm_zprior(z_prior_img)
+        image_z_cat = torch.cat([mu_img, z_prior_img], dim=1)
+
+        msk_main = torch.ones(B_align, num_frames, H_lat, W_lat, device=rank)
+        msk_main[:, 1:] = 0
+        msk_main = torch.cat([msk_main[:, 0:1].repeat(1, tf_stu, 1, 1), msk_main[:, 1:]], dim=1)
+        msk_main = msk_main.view(B_align, msk_main.shape[1] // tf_stu, tf_stu, H_lat, W_lat)
+        msk_main = msk_main.transpose(1, 2).to(dtype=precision)
+        if mask_mode == 'dual12':
+            tf_prior = 4
+            num_frames_prior = (num_frames + 1) // 2
+            msk_prior = torch.ones(B_align, num_frames_prior, H_lat, W_lat, device=rank)
+            msk_prior[:, 1:] = 0
+            msk_prior = torch.cat([msk_prior[:, 0:1].repeat(1, tf_prior, 1, 1), msk_prior[:, 1:]], dim=1)
+            msk_prior = msk_prior.view(B_align, msk_prior.shape[1] // tf_prior, tf_prior, H_lat, W_lat)
+            msk_prior = msk_prior.transpose(1, 2).to(dtype=precision)
+
+    if mask_mode == 'dual12':
+        x_stu = torch.cat([noisy_d, msk_main, msk_prior, image_z_cat], dim=1)
+    else:
+        x_stu = torch.cat([noisy_d, msk_main, image_z_cat], dim=1)
+
+    # ── patchify → blocks → head → unpatchify ──
+    x_stu = student_patchify(x_stu)
+    f_s, h_s, w_s = x_stu.shape[2:]
+    x_stu = rearrange(x_stu, 'b c f h w -> b (f h w) c').contiguous()
+
+    # diffusion timestep 의 t / t_mod (= block + head)
+    t_emb = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).to(precision))
+    t_mod = dit.time_projection(t_emb).unflatten(1, (6, dit.dim))
+
+    freqs_stu = torch.cat([
+        dit.freqs[0][:f_s].view(f_s, 1, 1, -1).expand(f_s, h_s, w_s, -1),
+        dit.freqs[1][:h_s].view(1, h_s, 1, -1).expand(f_s, h_s, w_s, -1),
+        dit.freqs[2][:w_s].view(1, 1, w_s, -1).expand(f_s, h_s, w_s, -1),
+    ], dim=-1).reshape(f_s * h_s * w_s, 1, -1).to(rank)
+
+    # [FIX] diffusion 은 velocity 예측 → 전체 DiT (모든 block) 통과 필요.
+    # _align_block_set 으로 거르면 align_num_blocks<40 시 denoiser 잘림 → 예측 틀림.
+    # align forward 와 달리 여기선 dit.blocks 전부 순회.
+    for bi, block in enumerate(dit.blocks):
+        if _dit_offload:
+            x_stu = CPUOffloadBlock.apply(x_stu, block, rank, context, t_mod, freqs_stu)
+        elif _use_gc and bi < grad_checkpoint_num_blocks:
+            x_stu = gradient_checkpoint_forward(block, True, False, x_stu, context, t_mod, freqs_stu)
+        else:
+            x_stu = block(x_stu, context, t_mod, freqs_stu)
+        if FSDPModule is not None and isinstance(block, FSDPModule):
+            block.reshard()
+
+    # davae_head: (B, seq, (z_dim+prior_z_dim)*patch_prod) → unpatchify → (B, z_dim+prior_z_dim, f, H, W)
+    x_head = davae_head(x_stu, t_emb)
+    patch_prod = int(math.prod(dit.patch_size))
+    main_flat = z_dim * patch_prod
+    px, py, pz = dit.patch_size
+    x_main = x_head[..., :main_flat]
+    x_prior = x_head[..., main_flat:]
+    out_main = rearrange(x_main, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
+                         f=f_s, h=h_s, w=w_s, x=px, y=py, z=pz)
+    out_prior = rearrange(x_prior, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
+                          f=f_s, h=h_s, w=w_s, x=px, y=py, z=pz)
+    noise_pred = torch.cat([out_main, out_prior], dim=1)  # (B, z_dim+prior_z_dim, T, H, W)
+
+    # ── flow match loss (per-sample MSE × training_weight) ──
+    # scheduler.training_weight 가 batch patch 됨 → per-sample (B,) weight 직접 반환 (= stage2 동일)
+    w = scheduler.training_weight(timestep).reshape(-1).to(device=rank).float()
+
+    def _per_sample_mse(pred, tgt):
+        e = F.mse_loss(pred.float(), tgt.float(), reduction='none')
+        return e.mean(dim=list(range(1, e.ndim)))
+
+    loss_diff = (_per_sample_mse(noise_pred, target) * w).mean()
+    with torch.no_grad():
+        loss_z_main = (_per_sample_mse(noise_pred[:, :z_dim], target[:, :z_dim]) * w).mean().item()
+        loss_z_prior = (_per_sample_mse(noise_pred[:, z_dim:], target[:, z_dim:]) * w).mean().item()
+
+    if logger is not None:
+        _mem = torch.cuda.memory_allocated(rank) / 1e9
+        logger.info(f"[mem] after diffusion forward: allocated={_mem:.2f}GB")
+
+    return loss_diff, loss_z_main, loss_z_prior
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +926,7 @@ def fused_dit_align_forward(
     batch=None, _align_bs=1,
     retain_grads=False, logger=None,
     align_projections=None,
-    use_teacher_subsample_noise=False,
+    teacher_subsample_noise_mode='off',
 ):
     """Fused teacher+student DiT forward with per-block alignment gradient injection.
 
@@ -780,11 +1023,8 @@ def fused_dit_align_forward(
         ], dim=-1).reshape(f_r * h_r * w_r, 1, -1).to(rank)
 
     # ── Student pre-block setup ──────────────────────────────────────────────
-    # [NEW - oliviaa] teacher noise 의 nearest spatial subsample (= i.i.d. N(0,1) 유지)
-    if use_teacher_subsample_noise:
-        noise_cat = F.interpolate(noise_ref.float(), size=z_cat_align.shape[2:], mode='nearest').to(z_cat_align.dtype)
-    else:
-        noise_cat = torch.randn_like(z_cat_align)
+    noise_cat = build_student_noise_cat(z_cat_align, teacher_noise=noise_ref,
+                                        mode=teacher_subsample_noise_mode)
     noisy_cat = scheduler.add_noise(z_cat_align, noise_cat, timestep)
     if retain_grads:
         noisy_cat.retain_grad()

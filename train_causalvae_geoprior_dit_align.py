@@ -88,6 +88,7 @@ from dit_align import (
     run_teacher_forward, run_student_forward, setup_dit_memory,
     setup_text_encoder_memory,
     fused_dit_align_forward,
+    run_student_diffusion_forward,
 )
 
 from torch.utils.data import DataLoader, DistributedSampler, Subset
@@ -162,19 +163,28 @@ class GeopriorDiTAlignModel(nn.Module):
                  normalize_zmain_bn=False, bn_momentum=0.1, zmain_bn_init='zprior',
                  z_dim=16,
                  use_align_projection=False, align_proj_dim=5120, align_proj_num_blocks=40,
-                 align_projection_init='zero'):
+                 align_projection_init='zero', align_proj_bottleneck_dim=64):
         super().__init__()
         self.vae = vae
-        # [NEW - oliviaa] block 별 residual projection (trilinear 후 conv3d residual, zero init)
+        # [NEW - oliviaa] block 별 residual projection (1x1 bottleneck Conv3d = MLP 와 동일, zero init).
+        # 구조: Conv3d(D, mid, 1) → Conv3d(mid, D, 1). mid=16 → params ~164K per block (40 block → 6.6M total).
+        # REPA/iREPA 등 distillation work 의 표준 patterns (= 1x1 channel projection, spatial context X).
+        # spatial context 는 LoRA + patchify 가 main 학습 담당. projection 은 channel re-projection 만.
+        # zero init: up conv (= 두 번째) 만 zero → residual 시작 시 trilinear 결과 그대로.
         if use_align_projection:
+            mid = align_proj_bottleneck_dim
             self.align_projections = nn.ModuleList([
-                nn.Conv3d(align_proj_dim, align_proj_dim, kernel_size=3, padding=1)
+                nn.Sequential(
+                    nn.Conv3d(align_proj_dim, mid, kernel_size=1),
+                    nn.Conv3d(mid, align_proj_dim, kernel_size=1),
+                )
                 for _ in range(align_proj_num_blocks)
             ])
             if align_projection_init == 'zero':
-                for m in self.align_projections:
-                    nn.init.zeros_(m.weight)
-                    nn.init.zeros_(m.bias)
+                # up conv 만 zero (down conv 는 default Kaiming-like init 유지)
+                for seq in self.align_projections:
+                    nn.init.zeros_(seq[1].weight)
+                    nn.init.zeros_(seq[1].bias)
         else:
             self.align_projections = None
         self.normalize_zprior = normalize_zprior
@@ -957,6 +967,25 @@ def train(args):
                         logger.info(f"[LoRA] resumed from ckpt: {_loaded} tensors loaded")
                 del _ckpt_for_lora
 
+            # [NEW - oliviaa] baseline(256 finetuned) LoRA 로 init (fresh start 시, resume 과 별개).
+            # teacher/student 공유 DiT 의 LoRA 시작점을 random 대신 256 적응본으로. base Wan 은 동일.
+            if getattr(args, 'init_lora_safetensors', None):
+                from safetensors.torch import load_file as _load_sf
+                _init_lora = _load_sf(args.init_lora_safetensors)
+                _dit_named = dict(dit.named_parameters())
+                _loaded = 0; _missing = []
+                for _k, _v in _init_lora.items():
+                    if _k in _dit_named:
+                        _dit_named[_k].data.copy_(_v.to(_dit_named[_k].device, _dit_named[_k].dtype))
+                        _loaded += 1
+                    else:
+                        _missing.append(_k)
+                if global_rank == 0:
+                    logger.info(f"[LoRA init] baseline LoRA from {args.init_lora_safetensors}: "
+                                f"{_loaded}/{len(_init_lora)} loaded, {len(_missing)} missing")
+                    if _missing:
+                        logger.warning(f"[LoRA init] missing 샘플: {_missing[:3]}")
+
     # Student patchify (FSDP 전에 생성 — pretrained weight 복사 필요)
     if args.align_weight > 0:
         _mask_ch = 12 if args.mask_mode == 'dual12' else 8
@@ -970,7 +999,10 @@ def train(args):
         student_patchify = student_patchify.to(rank)
 
         # z_prior patchify weight 고정 (pretrained copy 유지, z_main만 학습)
-        if getattr(args, 'freeze_patchify_zprior', False):
+        # [NEW - oliviaa] diffusion: --diffusion_unfreeze_zprior_patchify 켜면 freeze hook 끔
+        # → z_prior patchify 가 diffusion (+ align) gradient 로 학습 (= stage2 rm57nmln 동일).
+        _diff_unfreeze_zprior = getattr(args, 'diffusion_unfreeze_zprior_patchify', False)
+        if getattr(args, 'freeze_patchify_zprior', False) and not _diff_unfreeze_zprior:
             _z_dim = args.z_dim
             _prior_z_dim = _known.prior_z_dim
             def _zero_zprior_grad(grad):
@@ -981,6 +1013,8 @@ def train(args):
             student_patchify.weight.register_hook(_zero_zprior_grad)
             if global_rank == 0:
                 logger.info(f"Patchify z_prior channels frozen (weight[:, {_z_dim}:{_z_dim+_prior_z_dim}] + weight[:, -{_prior_z_dim}:])")
+        elif _diff_unfreeze_zprior and global_rank == 0:
+            logger.info("[diffusion] z_prior patchify UNFROZEN (freeze hook 생략, align+diffusion 학습)")
     else:
         if global_rank == 0:
             logger.info("align_weight=0: DiT and student_patchify not loaded (pure VAE training)")
@@ -992,9 +1026,20 @@ def train(args):
         logger=logger if global_rank == 0 else None,
     )
 
-    # FlowMatchScheduler — noise 추가용
+    # FlowMatchScheduler — align noise 추가용 (training=False, dit_num_inference_steps timestep)
     scheduler = FlowMatchScheduler(template="Wan")
     scheduler.set_timesteps(args.dit_num_inference_steps)
+
+    # [NEW - oliviaa] diffusion 전용 scheduler — stage2 (rm57nmln) 와 동일 (1000 step + training=True).
+    # training=True → linear_timesteps_weights 생성 (= flow match training weight). align scheduler 와 분리.
+    diffusion_scheduler = None
+    if getattr(args, 'use_diffusion_loss', False):
+        diffusion_scheduler = FlowMatchScheduler(template="Wan")
+        diffusion_scheduler.set_timesteps(1000, training=True)
+        if global_rank == 0:
+            logger.info("[diffusion] diffusion_scheduler set (1000 steps, training=True, "
+                        f"timesteps={len(diffusion_scheduler.timesteps)}, "
+                        f"has_weights={hasattr(diffusion_scheduler, 'linear_timesteps_weights')})")
 
     # Text context: null prompt / per-batch caption / T5 cache
     _use_caption = getattr(args, 'caption_metadata', None) is not None
@@ -1086,7 +1131,23 @@ def train(args):
         align_proj_dim=getattr(args, 'align_proj_dim', 5120),
         align_proj_num_blocks=getattr(args, 'align_num_blocks', 40),
         align_projection_init=getattr(args, 'align_projection_init', 'zero'),
+        align_proj_bottleneck_dim=getattr(args, 'align_proj_bottleneck_dim', 64),
     )
+    # [NEW - oliviaa] diffusion loss 용 DaVaeHead 등록 (= stage2 rm57nmln 동일).
+    # dit.head 복사 init (head_main zero, head_prior copy). DDP wrap 전 attach → grad sync.
+    # align_weight>0 조건 추가: diffusion 은 align 블록 안에서만 돌므로, align_weight=0 인데
+    # davae_head 등록되면 DDP static_graph 가 unused param 으로 에러 가능.
+    if getattr(args, 'use_diffusion_loss', False) and dit is not None and args.align_weight > 0:
+        from dit_align import build_davae_head
+        _prior_z_dim = _known.prior_z_dim
+        model.davae_head = build_davae_head(dit, z_dim=args.z_dim, prior_z_dim=_prior_z_dim)
+        if global_rank == 0:
+            _n = sum(p.numel() for p in model.davae_head.parameters())
+            logger.info(f"[diffusion] DaVaeHead registered (z_main={args.z_dim}ch zero-init, "
+                        f"z_prior={_prior_z_dim}ch copy-init, {_n:,} params)")
+    else:
+        model.davae_head = None
+
     # [NEW] SyncBN convert (multi-GPU 면) — REPA-E 따라
     if getattr(args, 'normalize_zmain_bn', False) and dist.get_world_size() > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -1099,8 +1160,14 @@ def train(args):
     # → trainable param 없으면 DDP 건너뛰고 plain model 사용. .module 인터페이스는 wrapper로 유지.
     _has_trainable_vae = any(p.requires_grad for p in model.parameters())
     if _has_trainable_vae:
+        # [NEW] static_graph=True: AdaptiveWeightedConv3d 의 (y, y) dual output + align_projections 의 dual-edge
+        # backward 시 DDP 가 같은 param 의 grad hook 두 번 발동 → "marked as ready twice" 에러.
+        # static_graph=True 는 graph 가 매 step 동일하다고 가정 → reducer 가 두 번 마킹 허용 (= 의도된 design).
+        # find_unused_parameters=True 와 함께 사용 가능 (PyTorch docs 공식 지원).
         model = DDP(
-            model, device_ids=[rank], find_unused_parameters=args.find_unused_parameters
+            model, device_ids=[rank],
+            find_unused_parameters=args.find_unused_parameters,
+            static_graph=True,
         )
     else:
         if global_rank == 0:
@@ -1215,6 +1282,47 @@ def train(args):
         modules_to_train += [vae_module.encoder.head, vae_module.conv1]
     if getattr(model.module, 'align_projections', None) is not None:
         modules_to_train.append(model.module.align_projections)
+    # [NEW - oliviaa] diffusion: davae_head 학습 대상 추가
+    _davae_head = getattr(model.module, 'davae_head', None)
+    if _davae_head is not None:
+        modules_to_train.append(_davae_head)
+    # [NEW - oliviaa] diffusion: block norms + modulation unfreeze (= rm57nmln unfreeze_block_norms_mod)
+    _block_norms_mod_params = []
+    if getattr(args, 'diffusion_unfreeze_block_norms_mod', False) and dit is not None and hasattr(dit, 'blocks'):
+        _bn_paths = ['norm3', 'self_attn.norm_q', 'self_attn.norm_k',
+                     'cross_attn.norm_q', 'cross_attn.norm_k', 'cross_attn.norm_k_img']
+        for blk in dit.blocks:
+            if hasattr(blk, 'modulation'):
+                blk.modulation.requires_grad = True
+                _block_norms_mod_params.append(blk.modulation)
+            for _path in _bn_paths:
+                _mod = blk
+                try:
+                    for _part in _path.split('.'):
+                        _mod = getattr(_mod, _part)
+                    for _pp in _mod.parameters():
+                        _pp.requires_grad = True
+                        _block_norms_mod_params.append(_pp)
+                except AttributeError:
+                    pass
+        if global_rank == 0:
+            logger.info(f"[diffusion] block norms+mod unfrozen: {len(_block_norms_mod_params)} tensors "
+                        f"({sum(p.numel() for p in _block_norms_mod_params):,} params)")
+
+    # [NEW] teacher_frozen_pretrained: teacher forward(align target)를 init Wan I2V 로 고정.
+    #   block_norms/mod 초기값(pretrained, 학습 전)을 snapshot → teacher forward 시 이 값으로 swap.
+    #   LoRA 는 enable_adapters(False) 로 끄면 되니 snapshot 불필요 (다시 켜면 학습된 LoRA 복원됨).
+    _teacher_frozen_pretrained = getattr(args, 'teacher_frozen_pretrained', False)
+    _teacher_bn0 = {}
+    if _teacher_frozen_pretrained:
+        from peft.tuners.tuners_utils import BaseTunerLayer  # teacher forward 에서 LoRA 토글용
+        for _p in _block_norms_mod_params:
+            _teacher_bn0[id(_p)] = _p.detach().clone()
+        if global_rank == 0:
+            logger.info(f"[teacher_frozen] align target = init pretrained Wan I2V. "
+                        f"block_norms snapshot: {len(_teacher_bn0)} tensors "
+                        f"({sum(p.numel() for p in _block_norms_mod_params):,} params). "
+                        f"teacher forward 시 LoRA off + 이 값으로 swap → 직후 원복")
 
     param_groups = [{'params': vae_params, 'lr': args.lr}]
     if patchify_params:
@@ -1234,6 +1342,19 @@ def train(args):
             if global_rank == 0:
                 logger.info(f"[align_proj] optimizer received {len(align_proj_params)} param tensors "
                             f"({sum(p.numel() for p in align_proj_params):,} elements) at lr={args.patchify_lr}")
+    # [NEW - oliviaa] diffusion: davae_head + block_norms_mod 를 optimizer 에 추가
+    if _davae_head is not None:
+        davae_params = [p for p in _davae_head.parameters() if p.requires_grad]
+        if davae_params:
+            param_groups.append({'params': davae_params, 'lr': args.patchify_lr})
+            if global_rank == 0:
+                logger.info(f"[diffusion] davae_head optimizer received {len(davae_params)} tensors "
+                            f"({sum(p.numel() for p in davae_params):,} params) at lr={args.patchify_lr}")
+    if _block_norms_mod_params:
+        param_groups.append({'params': _block_norms_mod_params, 'lr': args.patchify_lr})
+        if global_rank == 0:
+            logger.info(f"[diffusion] block_norms_mod optimizer received {len(_block_norms_mod_params)} tensors "
+                        f"({sum(p.numel() for p in _block_norms_mod_params):,} params) at lr={args.patchify_lr}")
     gen_optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     disc_optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()), lr=args.lr, weight_decay=0.01
@@ -1449,6 +1570,8 @@ def train(args):
                 # ─── [NEW - oliviaa/dit_align] DiT dual-branch alignment ───
                 align_loss = torch.tensor(0.0, device=rank)
                 align_per_layer = {}
+                _loss_diff = None  # [NEW] diffusion (flow matching) loss, no_fused path 에서만 set
+                _diff_z_main = _diff_z_prior = 0.0
                 if args.align_weight > 0:
                     _align_bs = args.align_batch_size if args.align_batch_size > 0 else inputs.shape[0]
                     _align_bs = min(_align_bs, inputs.shape[0])
@@ -1480,6 +1603,16 @@ def train(args):
                         if getattr(args, 'no_fused_align', False):
                             # [NEW] Origin (kk4aiuyq) 식: run_teacher → run_student → compute_alignment_loss.
                             # fused 의 per-block detach + AlignGradInjector 대신 sum(grad-tracked losses).backward().
+                            # [NEW] teacher_frozen_pretrained: teacher forward 동안만 dit 를 init pretrained Wan 으로 갈아끼움.
+                            #   (a) LoRA adapter off, (b) block_norms/mod → pretrained snapshot. 직후 원복.
+                            _teacher_bn_cur = {}
+                            if _teacher_frozen_pretrained:
+                                for _m in dit.modules():
+                                    if isinstance(_m, BaseTunerLayer):
+                                        _m.enable_adapters(False)              # LoRA off → base Wan body
+                                for _p in _block_norms_mod_params:
+                                    _teacher_bn_cur[id(_p)] = _p.data.clone()  # 학습된 현재값 백업
+                                    _p.data.copy_(_teacher_bn0[id(_p)])        # pretrained 값으로 swap
                             features_ref, grid_ref, context, t_mod, freqs_ref, _teacher_noise = run_teacher_forward(
                                 dit=dit, dit_pipe=dit_pipe,
                                 inputs_align=inputs_align,
@@ -1494,6 +1627,24 @@ def train(args):
                                 batch=batch, _align_bs=_align_bs,
                                 logger=logger if global_rank == 0 else None,
                             )
+                            # [NEW] teacher forward 끝 → dit 를 학습 상태로 원복 (student/diffusion forward 는 학습된 weight 사용).
+                            if _teacher_frozen_pretrained:
+                                for _p in _block_norms_mod_params:
+                                    _p.data.copy_(_teacher_bn_cur[id(_p)])     # 학습된 block_norms 복원
+                                for _m in dit.modules():
+                                    if isinstance(_m, BaseTunerLayer):
+                                        _m.enable_adapters(True)               # LoRA on → student denoiser 정상
+                            # [REPA-E 정석] align forward 동안 DiT(denoiser) freeze → align grad 가 VAE encoder 로만 흐름.
+                            # student_patchify + LoRA + block_norms_mod (= diffusion 과 공유되는 DiT param) 의 requires_grad 끔.
+                            # weight 는 frozen 이지만 activation grad 는 통과 → z_cat 거쳐 VAE 로 align grad 전달. 충돌 차단.
+                            _dit_align_frozen = []
+                            if getattr(args, 'align_stop_grad_dit', False):
+                                _cand = list(student_patchify.parameters()) if student_patchify is not None else []
+                                _cand += list(dit.parameters())
+                                for _p in _cand:
+                                    if _p.requires_grad:
+                                        _p.requires_grad_(False)
+                                        _dit_align_frozen.append(_p)
                             features_stu, grid_stu, noisy_cat, _patchify_output_ref = run_student_forward(
                                 student_patchify=student_patchify, dit=dit,
                                 inputs_align=inputs_align, z_cat_align=z_cat_align,
@@ -1509,7 +1660,7 @@ def train(args):
                                 retain_grads=(not args.no_log_grad and global_rank == 0 and current_step % args.log_steps == 0),
                                 logger=logger if global_rank == 0 else None,
                                 teacher_noise=_teacher_noise,
-                                use_teacher_subsample_noise=getattr(args, 'use_teacher_subsample_noise', False),
+                                teacher_subsample_noise_mode=getattr(args, 'teacher_subsample_noise_mode', 'off'),
                             )
                             align_loss, align_per_layer = compute_alignment_loss(
                                 features_stu, features_ref,
@@ -1521,6 +1672,37 @@ def train(args):
                             )
                             # align_weight 적용 (compute_alignment_loss 는 weight 안 받음 — train loop 에서 scale)
                             align_loss = _aw_for_fused * align_loss
+
+                            # [NEW - oliviaa] ablation: diffusion_only → align_loss ×0.
+                            # align forward 는 그대로 돌아서 z_cat dual-output 그래프 유지 (static_graph 안전),
+                            # 하지만 total 에 더해질 때 0 → VAE/공유param 으로 align grad 안 흐름. diffusion 만 학습.
+                            if getattr(args, 'diffusion_only', False):
+                                align_loss = align_loss * 0.0
+
+                            # [REPA-E 정석] align forward 끝 → DiT(denoiser) requires_grad 복원.
+                            # diffusion forward 는 정상 학습 (denoising grad → student_patchify/LoRA/block_norms/head).
+                            for _p in _dit_align_frozen:
+                                _p.requires_grad_(True)
+
+                            # [NEW - oliviaa] diffusion (flow matching) loss — REPA-E 방식 (z.detach()).
+                            # no_fused path 에서만 (context/t_mod 사용 가능). z_cat detach → VAE 무관.
+                            if getattr(args, 'use_diffusion_loss', False) and getattr(model.module, 'davae_head', None) is not None:
+                                _loss_diff, _diff_z_main, _diff_z_prior = run_student_diffusion_forward(
+                                    student_patchify=student_patchify, dit=dit,
+                                    davae_head=model.module.davae_head,
+                                    inputs_align=inputs_align, z_cat_align=z_cat_align,
+                                    scheduler=diffusion_scheduler, context=context,
+                                    model_module=model.module, mask_mode=args.mask_mode,
+                                    _align_block_set=_align_block_set,
+                                    _dit_offload=_dit_offload,
+                                    _use_gc=getattr(args, 'use_grad_checkpoint', False),
+                                    grad_checkpoint_num_blocks=getattr(args, 'grad_checkpoint_num_blocks', 0),
+                                    rank=rank, precision=precision,
+                                    z_dim=args.z_dim, prior_z_dim=_known.prior_z_dim,
+                                    min_timestep_boundary=getattr(args, 'diffusion_min_timestep_boundary', 0.0),
+                                    max_timestep_boundary=getattr(args, 'diffusion_max_timestep_boundary', 1.0),
+                                    logger=logger if (global_rank == 0 and current_step % args.log_steps == 0) else None,
+                                )
                         else:
                             align_loss, align_per_layer, noisy_cat, _patchify_output_ref = fused_dit_align_forward(
                                 dit=dit, student_patchify=student_patchify, dit_pipe=dit_pipe,
@@ -1543,7 +1725,7 @@ def train(args):
                                 retain_grads=(not args.no_log_grad and global_rank == 0 and current_step % args.log_steps == 0),
                                 logger=logger if global_rank == 0 else None,
                                 align_projections=getattr(model.module, 'align_projections', None),
-                                use_teacher_subsample_noise=getattr(args, 'use_teacher_subsample_noise', False),
+                                teacher_subsample_noise_mode=getattr(args, 'teacher_subsample_noise_mode', 'off'),
                             )
 
                 # [NEW] 2-backward adaptive (legacy path) — mutually exclusive with _AdaptiveWeightingFn.
@@ -1563,6 +1745,11 @@ def train(args):
                     total_loss = g_loss + args.align_weight * _w_adaptive_2bwd * align_loss
                 else:
                     total_loss = g_loss + align_loss
+
+                # [NEW - oliviaa] diffusion loss 결합 (= REPA-E denoising_loss).
+                # z_cat detach 라 VAE grad 무관 → student_patchify + LoRA + davae_head + block_norms_mod 만 업데이트.
+                if _loss_diff is not None:
+                    total_loss = total_loss + getattr(args, 'diffusion_loss_weight', 1.0) * _loss_diff
 
                 # [v26 disabled] 2bwd compare 비활성
                 _w_2bwd_compare = None
@@ -1636,13 +1823,38 @@ def train(args):
                         _dec = list(_vae.decoder.parameters())
                         _lora = [p for n, p in dit.named_parameters() if 'lora_' in n.lower()]
                         _patch = list(student_patchify.parameters()) if student_patchify is not None else []
-                        wandb.log({
+                        # [NEW] align_projections 학습 진행 추적 (= grad 흐르는지 + zero init 에서 weight 변화)
+                        _ap_module = getattr(model.module, 'align_projections', None)
+                        _ap = list(_ap_module.parameters()) if _ap_module is not None else []
+                        _log = {
                             "gnorm/encoder_body":    _gn(_enc_body),
                             "gnorm/encoder_head":    _gn(_enc_head),
                             "gnorm/decoder":         _gn(_dec),
                             "gnorm/dit_lora":        _gn(_lora),
                             "gnorm/student_patchify": _gn(_patch),
-                        }, step=optimizer_step)
+                        }
+                        if _ap:
+                            _log["gnorm/align_projections"] = _gn(_ap)
+                            # weight norm: zero init → 학습 진행 시 nonzero 증가
+                            _ap_wn_sq = sum(p.detach().float().norm().item() ** 2
+                                            for p in _ap if p.requires_grad)
+                            _log["weight/align_projections_norm"] = _ap_wn_sq ** 0.5
+                        # [NEW] diffusion: davae_head grad norm (= diffusion grad 흐름 검증)
+                        _dh_module = getattr(model.module, 'davae_head', None)
+                        if _dh_module is not None:
+                            _dh = [p for p in _dh_module.parameters() if p.requires_grad]
+                            if _dh:
+                                _log["gnorm/davae_head"] = _gn(_dh)
+                                # [NEW] davae_head weight norm: grad 흐름 → optimizer step → weight 변하는지 검증.
+                                # head_main 은 zero init → 학습되면 head_main norm 증가해야 함.
+                                _dh_named = {n: p for n, p in _dh_module.named_parameters() if p.requires_grad}
+                                _hm = [p for n, p in _dh_named.items() if 'head_main' in n]
+                                _hp = [p for n, p in _dh_named.items() if 'head_prior' in n]
+                                if _hm:
+                                    _log["weight/davae_head_main_norm"] = (sum(p.detach().float().norm().item()**2 for p in _hm))**0.5
+                                if _hp:
+                                    _log["weight/davae_head_prior_norm"] = (sum(p.detach().float().norm().item()**2 for p in _hp))**0.5
+                        wandb.log(_log, step=optimizer_step)
                     except Exception as _ge:
                         if current_step < 5:
                             logger.warning(f"[gnorm] fail: {_ge}")
@@ -1729,6 +1941,18 @@ def train(args):
                     # [FIX - oliviaa] student_patchify 는 DDP 밖이라 gradient 수동 sync
                     if dist.get_world_size() > 1 and student_patchify is not None:
                         for p in student_patchify.parameters():
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    # [FIX - oliviaa] dit LoRA 도 DDP 밖 (dit 는 DDP/FSDP wrap 안 됨) → gradient 수동 sync.
+                    # 이전엔 LoRA all_reduce 없어 8 GPU 가 각자 학습 (= effective batch = per-GPU batch,
+                    # ckpt 는 rank0 LoRA 만 저장 → 나머지 학습 버려짐). 이제 8 GPU 평균 (= effective batch 정상).
+                    if dist.get_world_size() > 1 and getattr(args, 'use_lora', False) and dit is not None:
+                        for n, p in dit.named_parameters():
+                            if 'lora_' in n and p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    # [NEW - oliviaa] diffusion: block_norms_mod 도 dit param (DDP 밖) → 수동 sync
+                    if dist.get_world_size() > 1 and _block_norms_mod_params:
+                        for p in _block_norms_mod_params:
                             if p.grad is not None:
                                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
@@ -1837,6 +2061,13 @@ def train(args):
                         wandb.log({"train/wl_loss": g_log['train/wl_loss']}, step=optimizer_step)
                     wandb.log({"train/align_loss": _al}, step=optimizer_step)
                     wandb.log({"train/total_loss": _tl}, step=optimizer_step)
+                    # [NEW - oliviaa] diffusion loss 로깅 (= REPA-E denoising_loss + z_main/z_prior 분리)
+                    if _loss_diff is not None:
+                        wandb.log({
+                            "train/diffusion_loss": float(_loss_diff.item()),
+                            "train/diff_loss_z_main": _diff_z_main,
+                            "train/diff_loss_z_prior": _diff_z_prior,
+                        }, step=optimizer_step)
                     # [REVIVED] align_loss_weighted — actual magnitude flowing through backward.
                     # adaptive paths: w sourced from active mode (2-backward vs single-backward).
                     if getattr(args, 'log_adaptive_weight', False):
@@ -1857,6 +2088,22 @@ def train(args):
                             _w_log = 1.0
                         wandb.log({"train/adaptive_weight_w": _w_log}, step=optimizer_step)
                         wandb.log({"train/align_loss_weighted": args.align_weight * _w_log * _al}, step=optimizer_step)
+                        # [NEW] adaptive_weight_w_raw (= clamp 전) + grad_W norm 매 step log
+                        # ratio = ||grad_W_main|| / (||grad_W_adv|| + eps). 분모(adv) 급락 시 ratio 폭증 → clamp → spike.
+                        # z_prior noise spike 원인 추적: adv norm 이 spike 직전 vanish 하는지 확인.
+                        try:
+                            from adaptive_weighted_causal_conv_3d import _AdaptiveWeightedConv3dFn as _Fn
+                            if getattr(_Fn, '_last_c_raw', None) is not None:
+                                wandb.log({"train/adaptive_weight_w_raw": float(_Fn._last_c_raw.item())}, step=optimizer_step)
+                            if getattr(_Fn, '_last_grad_W_main_norm', None) is not None:
+                                wandb.log({
+                                    "debug/grad_W_main_norm": float(_Fn._last_grad_W_main_norm.item()),
+                                    "debug/grad_W_adv_norm":  float(_Fn._last_grad_W_adv_norm.item()),
+                                    "debug/grad_y_main_norm": float(_Fn._last_grad_y_main_norm.item()),
+                                    "debug/grad_y_adv_norm":  float(_Fn._last_grad_y_adv_norm.item()),
+                                }, step=optimizer_step)
+                        except (ImportError, AttributeError):
+                            pass
 
                         # [v27c] 두 run 비교용 — 분자/분모 + W norm log
                         try:
@@ -2342,11 +2589,57 @@ def main():
                         help="trilinear 후 block 별 conv3d residual projection (zero init)")
     parser.add_argument("--align_proj_dim", type=int, default=5120,
                         help="projection conv 의 in/out channel (= DiT hidden_size)")
+    parser.add_argument("--align_proj_bottleneck_dim", type=int, default=16,
+                        help="bottleneck dim (= D→mid→D). 1x1 conv. mid=16 → ~164K params/block (40 block → 6.6M total). "
+                             "mid=8 → 3.3M total. REPA/iREPA 표준 patterns.")
     parser.add_argument("--align_projection_init", type=str, default="zero", choices=["zero", "random"],
                         help="zero=trilinear 그대로 시작, random=Kaiming init")
-    # [NEW - oliviaa] teacher noise 의 nearest subsample 으로 student noise 생성 (= correlated noise)
+    # [NEW - oliviaa] teacher noise 의 nearest subsample 으로 student noise 생성 (= correlated noise).
+    # mode 별 의미:
+    #   off     = both random (= 기존 동작, teacher correlation 없음)
+    #   z_main  = (A) z_main = teacher subsample, z_prior = randn
+    #   z_prior = (C) z_main = randn, z_prior = teacher subsample (= default, 학습 초기 align 효과 강함)
+    #   both    = (B) z_main + z_prior 둘 다 같은 teacher subsample (= channel correlation 1, train/test mismatch 위험)
+    parser.add_argument("--teacher_subsample_noise_mode", type=str, default='off',
+                        choices=['off', 'z_main', 'z_prior', 'both'],
+                        help="teacher noise subsample 적용 부분. C='z_prior' 권장")
+    # [DEPRECATED] backward compat: 기존 flag 켜져 있으면 mode='z_prior' 로 자동 변환
     parser.add_argument("--use_teacher_subsample_noise", action="store_true", default=False,
-                        help="student noise 를 teacher noise 의 nearest spatial subsample 으로 만듦")
+                        help="[deprecated] 켜지면 --teacher_subsample_noise_mode=z_prior 로 변환")
+    # [NEW - oliviaa] diffusion (flow matching) loss — REPA-E 방식 (z.detach()), stage2 rm57nmln 동일
+    parser.add_argument("--use_diffusion_loss", action="store_true", default=False,
+                        help="student DiT 에 flow matching diffusion loss 추가 (z_cat detach → VAE 무관). no_fused_align 필요")
+    parser.add_argument("--diffusion_loss_weight", type=float, default=1.0,
+                        help="diffusion loss 가중치 (total_loss += weight * loss_diff). REPA: diffusion 1.0 main")
+    parser.add_argument("--diffusion_max_timestep_boundary", type=float, default=1.0,
+                        help="diffusion timestep 상한 (0~1, scheduler.timesteps 비율). stage2 동일")
+    parser.add_argument("--diffusion_min_timestep_boundary", type=float, default=0.0,
+                        help="diffusion timestep 하한 (0~1)")
+    parser.add_argument("--diffusion_unfreeze_zprior_patchify", action="store_true", default=False,
+                        help="z_prior patchify freeze hook 끔 → diffusion+align 으로 학습 (stage2 rm57nmln 동일)")
+    parser.add_argument("--diffusion_unfreeze_block_norms_mod", action="store_true", default=False,
+                        help="DiT block norm+modulation unfreeze (~2.6M, rm57nmln unfreeze_block_norms_mod 동일)")
+    # [NEW - oliviaa] ablation: align loss 의 grad 기여를 0 으로 → diffusion only.
+    # align forward 는 v43 과 동일하게 그대로 실행 (B-adaptive dual-output graph topology 유지,
+    # static_graph 안전). align_loss 만 ×0 → VAE/block_norms/patchify/projection 으로 가는 align grad 차단.
+    # 목적: z_prior diffusion loss spike 가 align 충돌 때문인지 격리 검증 (align 없으면 0.19 근처 머무는지).
+    parser.add_argument("--diffusion_only", action="store_true", default=False,
+                        help="[ablation] align_loss 를 total 에 더할 때 ×0 (align grad 차단, diffusion 만 학습). DiT/davae_head 는 정상 로드")
+    # [NEW - oliviaa] REPA-E 정석: align forward 동안 DiT(denoiser) freeze → align grad 가 VAE encoder 로만.
+    # REPA-E train_repae.py:371-372 `requires_grad(SiT, False)` 동일. diffusion forward 는 정상 학습(z.detach).
+    # 목적: align(VAE 정렬) 유지하면서 denoiser 충돌(z_prior spike) 제거. = alignment→VAE only / diffusion→denoiser only.
+    parser.add_argument("--align_stop_grad_dit", action="store_true", default=False,
+                        help="[REPA-E 정석] align forward 동안 student_patchify+LoRA+block_norms freeze → align grad 가 VAE encoder 로만 흐름. diffusion forward 는 정상")
+    # [NEW] teacher forward(align target)를 init 시점 pretrained Wan I2V 14B 로 고정.
+    # teacher/student 는 dit 객체를 공유 → student diffusion 이 LoRA/block_norms 를 학습하면 teacher align target 도 같이 drift 됨.
+    # 이 플래그 on 이면 teacher forward 그 순간에만 (a) LoRA adapter off + (b) block_norms/mod 를 pretrained 초기값으로 swap → align target 이 init Wan 으로 고정. 직후 원복.
+    # 별도 dit copy 불필요 (메모리 ≈ block_norms snapshot ~5MB). student/diffusion forward 는 학습된 weight 그대로.
+    parser.add_argument("--teacher_frozen_pretrained", action="store_true", default=False,
+                        help="[NEW] teacher forward 동안만 LoRA off + block_norms/mod 를 pretrained 초기값으로 swap → align target 을 init Wan I2V 14B 로 고정 (drift 차단)")
+    # [NEW - oliviaa] teacher/student 공유 DiT 의 LoRA 를 baseline(256 finetuned) LoRA safetensors 로 init.
+    # base Wan 은 동일 pretrained, LoRA 만 256 적응본으로 교체 → teacher align target + student denoiser 둘 다 256 친화 시작점.
+    parser.add_argument("--init_lora_safetensors", type=str, default=None,
+                        help="[NEW] DiT LoRA 초기값을 이 safetensors(PEFT 형식 lora_A/B) 로 로드. random init 대신 baseline LoRA 주입")
     parser.add_argument("--align_block_stride", type=int, default=1,
                         help="block 선택 간격. 1=연속(앞쪽 N개), 2=짝수번째(0,2,4,...). stride>1이면 전체 depth 커버")
     parser.add_argument("--align_batch_size", type=int, default=0,
@@ -2357,6 +2650,10 @@ def main():
                         help="gradient clipping max norm. 0=비활성화, >0=clipping 적용. 7.0 권장")
 
     args = parser.parse_args()
+
+    # [NEW] backward compat: deprecated flag → new mode
+    if getattr(args, 'use_teacher_subsample_noise', False) and args.teacher_subsample_noise_mode == 'off':
+        args.teacher_subsample_noise_mode = 'z_prior'
 
     # [NEW] Mutual exclusion for adaptive weighting paths.
     if getattr(args, 'use_2backward_adaptive', False):
