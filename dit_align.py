@@ -249,7 +249,7 @@ def create_student_patchify(dit, in_channels=None, init_mode='zero', mask_init='
 
 def compute_alignment_loss(features_stu, features_ref, grid_stu, grid_ref,
                             loss_type='mse', selected_layers=None, agg='sum',
-                            align_projections=None):
+                            align_projections=None, sample_weight=None):
     """[NEW - oliviaa/dit_align] Per-layer DiT feature alignment loss.
     features_stu[l] 을 spatial reshape → trilinear upsample → features_ref[l] 과 비교.
 
@@ -284,8 +284,15 @@ def compute_alignment_loss(features_stu, features_ref, grid_stu, grid_ref,
         if loss_type == 'mse':
             loss_l = F.mse_loss(feat_s_up, feat_r_gpu.float())
         elif loss_type == 'cosine':
-            loss_l = 1.0 - (F.normalize(feat_s_up, dim=-1) *
-                            F.normalize(feat_r_gpu.float(), dim=-1)).sum(-1).mean()
+            _cos = (F.normalize(feat_s_up, dim=-1) *
+                    F.normalize(feat_r_gpu.float(), dim=-1)).sum(-1)   # (B, seq)
+            if sample_weight is not None:
+                # [RESTORE matchS2] stage2 식 per-sample × bsmntw weight (= KinemaDAEFlowMatchSFTLoss 의 per_sample×weight).
+                #   seq 평균 → (B,) → weight(B,) 곱 → batch 평균.
+                loss_l = ((1.0 - _cos).mean(dim=1) * sample_weight.to(_cos.device)).mean()
+            else:
+                # off: (1.0 - _cos).mean() == 1.0 - _cos.mean() == 기존 (byte-identical)
+                loss_l = (1.0 - _cos).mean()
         elif loss_type == 'l2_mean':
             loss_l = (feat_s_up - feat_r_gpu.float()).pow(2).sum(dim=-1).sqrt().mean()
         name = 'patch' if l == 0 else f'b{l-1}'

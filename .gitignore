@@ -19,3 +19,4 @@ panda70m_eval.txt
 logs/
 *.log
 *.png
+pca_feature_dump.pt
