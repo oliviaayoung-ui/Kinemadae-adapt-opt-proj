@@ -150,6 +150,12 @@ class TrainVideoDataset(data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # [NEW - mixed-length] idx 가 "{idx}-{L}" str 이면 L 프레임, int 면 기존 sequence_length.
+        #   (Open-Sora datasets.py:235 의 "index.split('-')" hack 간소판 — 길이를 index 에 실어 worker 로 전달)
+        if isinstance(idx, str):
+            idx, _seq_len = (int(x) for x in idx.split("-"))
+        else:
+            _seq_len = self.sequence_length
         sample = self.samples[idx]
         # [Modified - oliviaa] dict(jsonl/parquet) 또는 str(txt/folder) 지원
         if isinstance(sample, dict):
@@ -161,15 +167,18 @@ class TrainVideoDataset(data.Dataset):
             start_frame_idx = None
             end_frame_idx = None
         try:
-            video = self.decord_read(video_path, start_frame_idx, end_frame_idx)
+            video = self.decord_read(video_path, start_frame_idx, end_frame_idx, seq_len=_seq_len)
             video = self.transform(video)  # T C H W -> T C H W
             video = video.transpose(0, 1)  # T C H W -> C T H W
             return dict(video=video, label="", video_path=video_path)
         except Exception as e:
             print(f"Error with {e}, {video_path}")
-            return self.__getitem__(random.randint(0, self.__len__() - 1))
+            # [NEW] fallback 도 같은 길이 L 유지 (배치 내 길이 통일 보장 — 안 그러면 collate 깨짐)
+            return self.__getitem__(f"{random.randint(0, self.__len__() - 1)}-{_seq_len}")
 
-    def decord_read(self, path, start_frame_idx=None, end_frame_idx=None):
+    def decord_read(self, path, start_frame_idx=None, end_frame_idx=None, seq_len=None):
+        if seq_len is None:
+            seq_len = self.sequence_length          # [NEW] None=기존 동작 (하위호환)
         decord_vr = self.v_decoder(path)
         actual_total = len(decord_vr)
         # [Modified - oliviaa] start/end frame 지원 + 불일치 검증
@@ -187,12 +196,12 @@ class TrainVideoDataset(data.Dataset):
             sample_rate = random.randint(1, self.sample_rate)
         else:
             sample_rate = self.sample_rate
-        size = self.sequence_length * sample_rate
-        if total_frames < self.sequence_length:
-            raise ValueError(f"Video too short: {total_frames} frames < {self.sequence_length} required")
+        size = seq_len * sample_rate
+        if total_frames < seq_len:
+            raise ValueError(f"Video too short: {total_frames} frames < {seq_len} required")
         start_frame_ind, end_frame_ind = TemporalRandomCrop(total_frames, size)
         frame_indice = np.linspace(
-            start_frame_ind, end_frame_ind - 1, self.sequence_length, dtype=int
+            start_frame_ind, end_frame_ind - 1, seq_len, dtype=int
         )
         frame_indice = frame_indice + frame_offset
 
@@ -247,9 +256,10 @@ class ValidVideoDataset(data.Dataset):
                 ToTensorVideo(),
                 Resize(_resize_size),
                 CenterCropVideo(_crop_size) if crop_size is not None else Lambda(lambda x: x),
+                Lambda(lambda x: 2.0 * x - 1.0),   # [FIX] train(TrainVideoDataset)과 동일하게 [-1,1] 정규화. 누락돼서 valid가 [0,1] OOD 입력으로 측정되던 버그 수정.
             ]
         )
-        
+
     def _make_dataset(self, real_video_dir):
         # [Modified - oliviaa] txt, jsonl, parquet 지원
         if real_video_dir.endswith('.txt'):

@@ -798,25 +798,48 @@ class Decoder3d(nn.Module):
                     x = layer(x)
             resample_mode = next((l.mode for l in stage if isinstance(l, Resample)), 'none')
             if resample_mode == 'upsample3d':
-                # 2D spatial pixel_shuffle per frame. For T_in>1 (single-pass), expand
-                # temporally to match T_out: first frame as-is, subsequent frames each
-                # repeated 2x (matching chunked per-chunk broadcast behaviour).
-                skip = rearrange(x_in, 'b c t h w -> (b t) c h w')
-                skip = skip.repeat_interleave(4, dim=1)
-                skip = F.pixel_shuffle(skip, 2)
-                skip = rearrange(skip, '(b t) c h w -> b c t h w', b=B)
-                if T_in > 1:
-                    skip = torch.cat([
-                        skip[:, :, :1, :, :],
-                        skip[:, :, 1:, :, :].repeat_interleave(2, dim=2)
-                    ], dim=2)
+                if feat_cache is not None:
+                    # [FIX 2026-06-27 frame-drop root cause] chunked decode: main Resample은
+                    #   chunk당 full 2x temporal(2t) 생산. 기존엔 이 chunk 분기가 없어
+                    #   single-pass 로직(1+(t-1)*2 = 2t-1)을 chunked 에도 적용 → main(2t)과
+                    #   1프레임 어긋나 x+skip 에서 손실(17->15, 81->71). add_upsamples skip
+                    #   (line 744-752)과 동일하게 chunk 분기 추가해 길이 일치.
+                    if T_in == 1:
+                        # first chunk: Resample 'Rep'(temporal 유지) — 공간만 2x
+                        skip = rearrange(x_in, 'b c t h w -> (b t) c h w')
+                        skip = skip.repeat_interleave(4, dim=1)
+                        skip = F.pixel_shuffle(skip, 2)
+                        skip = rearrange(skip, '(b t) c h w -> b c t h w', b=B)
+                    else:
+                        # subsequent chunk: full 2x temporal(2t) — main 과 길이 일치
+                        skip = x_in.repeat_interleave(8, dim=1)
+                        skip = pixel_shuffle_3d(skip, 2)
+                else:
+                    # 2D spatial pixel_shuffle per frame. For T_in>1 (single-pass), expand
+                    # temporally to match T_out: first frame as-is, subsequent frames each
+                    # repeated 2x (matching chunked per-chunk broadcast behaviour).
+                    skip = rearrange(x_in, 'b c t h w -> (b t) c h w')
+                    skip = skip.repeat_interleave(4, dim=1)
+                    skip = F.pixel_shuffle(skip, 2)
+                    skip = rearrange(skip, '(b t) c h w -> b c t h w', b=B)
+                    if T_in > 1:
+                        skip = torch.cat([
+                            skip[:, :, :1, :, :],
+                            skip[:, :, 1:, :, :].repeat_interleave(2, dim=2)
+                        ], dim=2)
             elif resample_mode == 'upsample2d':
                 skip = rearrange(x_in, 'b c t h w -> (b t) c h w')
                 skip = skip.repeat_interleave(4, dim=1)
                 skip = F.pixel_shuffle(skip, 2)
                 skip = rearrange(skip, '(b t) c h w -> b c t h w', b=B)
             elif resample_mode == 'upsample_temporal':
-                if T_in > 1:
+                if feat_cache is not None:
+                    # [FIX] chunked: main 과 동일하게 full 2x temporal
+                    if T_in == 1:
+                        skip = x_in
+                    else:
+                        skip = x_in.repeat_interleave(2, dim=2)
+                elif T_in > 1:
                     skip = torch.cat([
                         x_in[:, :, :1, :, :],
                         x_in[:, :, 1:, :, :].repeat_interleave(2, dim=2)
@@ -1106,7 +1129,22 @@ class WanVAE_(nn.Module):
             x = torch.cat([z_main, z_p], dim=1)                 # (B, prior_z_dim*2, T', H', W')
         else:
             x = self.conv2(z)
-        if self.training:
+        # [NEW] force_single_pass: eval-mode 에서도 chunk 안 하고 single-pass decode (81f chunk 버그 회피용).
+        #   chunking 은 긴 영상 메모리 절약용이라 기본 유지, 정확한 측정 필요 시에만 플래그 켬.
+        # [NEW group-chunk] decode_chunk_latent>0: K latent position 씩 묶어 chunked decode (학습+eval 모두).
+        #   목적: 256x81 학습 시 single-pass upsample backward INT_MAX 회피하면서 frame-by-frame(느림) 안 쓰기.
+        #   feat_cache가 경계 context 이어주므로 single-pass와 동치(검증 필수). default 0 = 기존 동작 유지.
+        _chunk = getattr(self, 'decode_chunk_latent', 0)
+        if _chunk and _chunk > 0:
+            _outs = []
+            for i in range(0, iter_, _chunk):
+                self._conv_idx = [0]
+                _outs.append(self.decoder(
+                    x[:, :, i:i + _chunk, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx))
+            out = torch.cat(_outs, 2)
+        elif self.training or getattr(self, 'force_single_pass', False):
             out = self.decoder(x)
         else:
             for i in range(iter_):

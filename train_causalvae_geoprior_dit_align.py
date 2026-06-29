@@ -121,7 +121,7 @@ except:
 from kinemadae import WanVAE_, _video_vae
 from perceptual_loss import LPIPSWithDiscriminator3D
 from ema_model import EMA
-from ddp_sampler import CustomDistributedSampler
+from ddp_sampler import CustomDistributedSampler, MixedLengthBatchSampler
 from video_dataset import TrainVideoDataset, ValidVideoDataset
 from video_utils import tensor_to_video
 from distrib_utils import DiagonalGaussianDistribution
@@ -640,23 +640,55 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
     z_cat_vecs = []    # [NEW - oliviaa/dit_align] z_cat (student latent) for alignment CKA
     z_ref_vecs = []    # [NEW - oliviaa/dit_align] z_ref (teacher latent) for alignment CKA
 
+    # [NEW - jeeyoung] SSVAE-style diffusability — z_main(=encoder mu) per video 수집.
+    #   각 batch 의 mu (B, C, T, H, W) 를 video 단위로 쪼개 CPU float 로 보관(GPU mem 절약).
+    zmain_list = []
+
+    # [NEW] decoder noise robustness — z_main 에 sigma*std 노이즈 후 decode, clean recon 대비 PSNR.
+    _noise_sigmas = ([float(x) for x in getattr(args, 'noise_robust_sigmas', '0.1,0.2,0.3,0.5').split(',')]
+                     if getattr(args, 'eval_noise_robust', False) else [])
+    noise_robust_acc = {s: [] for s in _noise_sigmas}
+
     # [NEW - oliviaa/dit_align] dit_pipe 접근 — valid() 밖에서 주입
     _dit_pipe = getattr(valid, '_dit_pipe', None)
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             inputs = batch["video"].to(rank)
+            # [NEW] 긴(>=33f) eval 은 chunk 버그 회피 위해 single-pass decode 강제 (256x17 등 짧은 건 chunk 그대로).
+            #   decode 의 force_single_pass 플래그 (kinemadae_geoprior.py WanVAE_.decode) 를 frame 수로 토글.
+            (model.module if hasattr(model, 'module') else model).vae.force_single_pass = (inputs.shape[2] >= 33)
             with torch.cuda.amp.autocast(dtype=precision):
                 outputs = model(inputs)
                 video_recon = outputs[0]
+
+            # [NEW - jeeyoung] decode frame 수 검증용 — 첫 배치의 입력 T vs decode 출력 T 캡처.
+            #   학습 중 chunked-decode frame 손실(17->15 / 81->71) 없는지 valid_model 에서 로깅.
+            if batch_idx == 0:
+                valid._frame_check = (int(inputs.shape[2]), int(video_recon.shape[2]))
+
+            # [NEW - jeeyoung] diffusability 용 z_main(mu) 수집.
+            #   encode 의 return 가 (mu, log_var) 또는 ((mu, log_var), (mu_adv, log_var_adv)).
+            #   forward() (line 284-295) 와 동일한 tuple-handling 으로 첫 mu 만 취함.
+            with torch.cuda.amp.autocast(dtype=precision):
+                _enc = model.module.vae.encode(inputs, scale=None)
+                _is_b_adaptive = (isinstance(_enc, tuple) and len(_enc) == 2
+                                  and isinstance(_enc[0], tuple))
+                if _is_b_adaptive:
+                    (mu, _log_var), (_mu_adv, _log_var_adv) = _enc
+                else:
+                    mu, _log_var = _enc
+            for b in range(mu.shape[0]):
+                zmain_list.append(mu[b].detach().float().cpu())
 
             # Upload videos
             if global_rank == 0:
                 for i in range(len(video_recon)):
                     if num_video_log <= 0:
                         break
-                    gt_video = tensor_to_video(inputs[i])
-                    rec_video = tensor_to_video(video_recon[i])
+                    # [FIX] tensor_to_video 는 [0,1] 입력 기대(내부에서 2x-1). 입력/recon 은 [-1,1] 이므로 [0,1] 매핑 후 전달 (안 하면 영상 어두워짐).
+                    gt_video = tensor_to_video((inputs[i] + 1.0) / 2.0)
+                    rec_video = tensor_to_video((torch.clamp(video_recon[i], -1.0, 1.0) + 1.0) / 2.0)
                     # [FIX - jeeyoung] gt/recon (T,C,H,W) 프레임·H 불일치 방어 — 공통 길이로 crop 후 concat(axis=3=W).
                     #   stage1 recon 은 같은 입력이라 보통 동일하지만 stage2/align gen-snap 버그와 일관되게 방어.
                     _tt = min(gt_video.shape[0], rec_video.shape[0]); _hh = min(gt_video.shape[2], rec_video.shape[2])
@@ -688,6 +720,37 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
                             z_ref_batch.append(z_i.mean(dim=(1, 2, 3)))  # global avg pool → (C,)
                         z_ref_vecs.append(torch.stack(z_ref_batch).detach().cpu())
 
+            # [NEW] noise robustness — z_main 에 sigma*std 노이즈 추가 후 decode, "같은 base 의 clean decode" 대비 PSNR.
+            #   [FIX 2026-06] 기존 버그: clean ref 로 video_recon(forward 의 reparameterize 샘플#1) 을 쓰고,
+            #     _zcat 은 새 reparameterize(샘플#2) 로 만들어 비교 → forward 가 (x_recon, mu, log_var) 3개만 반환해
+            #     len(outputs)>3 가 항상 False → 매번 새 샘플 → sigma=0 에서도 두 샘플 차이만큼 baseline mse →
+            #     480x832x81 noise_robust 가 9.5 로 평평(baseline 이 added noise 를 압도)했음.
+            #   수정: mu(outputs[1], deterministic) 로 z_main base 고정 + 같은 _zcat 의 clean decode 대비 비교
+            #     → reparam randomness 제거 + sigma=0 baseline 0 보장. (clean decode 1회 추가, 출력 tensor 만 보관해 메모리 cheap.)
+            if _noise_sigmas:
+                _vae = model.module.vae
+                _zdim = getattr(_vae, 'z_dim', 16)
+                _zp = raw_model._encode_prior(inputs)
+                _zcat = torch.cat([outputs[1], _zp], dim=1)  # mu(deterministic), reparameterize 아님
+                # [FIX 2026-06-27] per-channel std — 디퓨전/flow-matching은 채널별 표준화((z-μ_c)/std_c) 후 unit noise라
+                #   원본 공간 노이즈는 채널별 std_c 비례여야 함. 글로벌 std 1개는 채널 편차(측정 2.3배)만큼 어긋남
+                #   (작은채널 과노이즈/큰채널 과소노이즈). diffusability_pr/lowfreq도 채널별 표준화라 일관성도 맞춤.
+                _zstd = _zcat[:, :_zdim].float().std(dim=(0, 2, 3, 4), keepdim=True).to(_zcat.dtype)  # (1,C,1,1,1)
+                with torch.cuda.amp.autocast(dtype=precision):
+                    _clean_nr = _vae.decode(_zcat, scale=None)  # 같은 base 의 clean decode (baseline=0 보장)
+                for _s in _noise_sigmas:
+                    _zc = _zcat.clone()
+                    _zc[:, :_zdim] = _zc[:, :_zdim] + (_s * _zstd) * torch.randn_like(_zc[:, :_zdim])
+                    with torch.cuda.amp.autocast(dtype=precision):
+                        _noisy = _vae.decode(_zc, scale=None)
+                    _tt = min(_noisy.shape[2], _clean_nr.shape[2])
+                    # [FIX] decode 출력 [-1,1] → [0,1] 매핑 후 MSE (PSNR과 동일 스케일, -6dB shift 제거)
+                    _n01 = (torch.clamp(_noisy[:, :, :_tt].float(), -1.0, 1.0) + 1.0) / 2.0
+                    _c01 = (torch.clamp(_clean_nr[:, :, :_tt].float(), -1.0, 1.0) + 1.0) / 2.0
+                    _mse = torch.mean((_n01 - _c01) ** 2)
+                    noise_robust_acc[_s].append((-10.0 * torch.log10(_mse + 1e-12)).item())
+                del _clean_nr
+
             B, C, T, H, W = inputs.shape
             inputs = rearrange(inputs, "b c t h w -> (b t) c h w").contiguous()
             video_recon = rearrange(
@@ -696,7 +759,11 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
 
             # Calculate per-video PSNR (one value per video, not per batch)
             # to avoid partial-batch bias when DDP gather averages across ranks
-            mse = torch.mean(torch.square(inputs - video_recon), dim=(1, 2, 3))  # (B*T,)
+            # [FIX] 입력이 [-1,1]이므로 PSNR은 [0,1]로 매핑 후 MAX=1 공식(범위 불변 = [0,1]-equivalent PSNR).
+            #   매핑 안 하면 MAX=1에 [-1,1] 데이터라 -6dB 낮게 나옴. (LPIPS는 아래서 [-1,1] 원본 그대로 사용)
+            _in01 = (inputs + 1.0) / 2.0
+            _rec01 = (torch.clamp(video_recon, -1.0, 1.0) + 1.0) / 2.0
+            mse = torch.mean(torch.square(_in01 - _rec01), dim=(1, 2, 3))  # (B*T,)
             psnr_frames = 20 * torch.log10(1 / torch.sqrt(mse))  # (B*T,)
             psnr_per_video = psnr_frames.view(B, T).mean(dim=1)   # (B,) mean over frames
             psnr_list.extend(psnr_per_video.detach().cpu().tolist())
@@ -714,7 +781,59 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
                 bar.update()
             # Release gpus memory
             torch.cuda.empty_cache()
-    return psnr_list, lpips_list, video_log, z_main_vecs, z_prior_vecs, z_cat_vecs, z_ref_vecs
+
+    # [NEW - jeeyoung] SSVAE diffusability metrics — per-channel STANDARDIZED z_main 위에서 계산.
+    #   (1) few-mode participation ratio: correlation eigenspectrum 의 PR(=낮을수록 diffusable)
+    #   (2) low-freq ratio: 3D-DCT power 의 low-freq corner(각 축 첫 1/4) 비중(=높을수록 diffusable).
+    #   [변경 - jeeyoung] 기존엔 rank별 계산 후 mean → HD eval(영상 4개/8rank<4)서 NaN.
+    #         이제 z_main 을 rank 간 all_gather 하여 rank0 에서 "전체 pool 1번" 계산 후 broadcast.
+    #         (256 base 도 전체로 계산 → standalone 측정과 동일 방식. HD 도 gather 라 유효.)
+    from scipy.fft import dctn   # np 는 모듈 레벨 사용 (함수 내 import 시 valid() 앞부분 np 사용이 UnboundLocalError)
+    import torch.distributed as dist
+    _ws = dist.get_world_size() if dist.is_initialized() else 1
+    if _ws > 1:
+        _gathered = [None for _ in range(_ws)]
+        dist.all_gather_object(_gathered, [z.cpu() for z in zmain_list])   # 전 rank z_main(CPU) 수집
+        all_zmain = [z for sub in _gathered if sub for z in sub] if rank == 0 else []
+    else:
+        all_zmain = zmain_list
+    if rank == 0 or _ws == 1:
+        if len(all_zmain) >= 4:
+            Z = torch.stack(all_zmain).float()               # (Nv, C, T, H, W) — 전 rank pool
+            Nv, Cc, T, H, W = Z.shape
+            mean = Z.mean(dim=(0, 2, 3, 4), keepdim=True); std = Z.std(dim=(0, 2, 3, 4), keepdim=True) + 1e-8
+            Zs = (Z - mean) / std                            # per-channel unit-variance standardize
+            X = Zs.permute(1, 0, 2, 3, 4).reshape(Cc, -1)
+            cov = (X @ X.T) / (X.shape[1] - 1)
+            ev = torch.linalg.eigvalsh(cov).clamp(min=0).flip(0)
+            pr = (ev.sum() ** 2 / (ev ** 2).sum()).item()
+            lf = []
+            for v in range(Nv):
+                D = dctn(Zs[v].numpy(), axes=(-3, -2, -1), norm='ortho'); P = (D ** 2).mean(0)
+                lf.append(P[:max(1, T // 4), :max(1, H // 4), :max(1, W // 4)].sum() / P.sum())
+            low_freq = float(np.mean(lf))
+        else:
+            pr, low_freq = float('nan'), float('nan')
+    else:
+        pr, low_freq = float('nan'), float('nan')
+
+    # [변경 - jeeyoung] rank0 의 전체-pool 결과를 전 rank 로 broadcast (기존 all_reduce mean 대체)
+    _t = torch.tensor([pr, low_freq], device=rank, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.broadcast(_t, src=0)
+    pr, low_freq = _t[0].item(), _t[1].item()
+
+    # [NEW] noise robustness rank 평균 (sigma 별)
+    noise_robust = {}
+    if _noise_sigmas:
+        _nr = torch.tensor([(np.mean(noise_robust_acc[s]) if noise_robust_acc[s] else float('nan'))
+                            for s in _noise_sigmas], device=rank, dtype=torch.float32)
+        _nr = torch.nan_to_num(_nr, nan=0.0)
+        if dist.is_initialized():
+            dist.all_reduce(_nr, op=dist.ReduceOp.SUM); _nr /= dist.get_world_size()
+        noise_robust = {s: _nr[i].item() for i, s in enumerate(_noise_sigmas)}
+
+    return psnr_list, lpips_list, video_log, z_main_vecs, z_prior_vecs, z_cat_vecs, z_ref_vecs, pr, low_freq, noise_robust
 
 
 def gather_valid_result(psnr_list, lpips_list, video_log_list, rank, world_size,
@@ -1252,13 +1371,31 @@ def train(args):
         is_main_process=global_rank == 0,
     )
     ddp_sampler = CustomDistributedSampler(dataset)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=ddp_sampler,
-        pin_memory=True,
-        num_workers=args.dataset_num_worker,
-    )
+    if args.mix_frames:
+        # [NEW] 17/81 혼합 — batch_sampler 는 batch_size/sampler/shuffle 와 동시 사용 불가
+        batch_sampler = MixedLengthBatchSampler(
+            ddp_sampler,
+            batch_size=args.batch_size,
+            base_num_frames=args.num_frames,
+            mix_81_prob=args.mix_81_prob,
+            mix_81_num_frames=args.mix_81_num_frames,
+            mix_81_batch_size=args.mix_81_batch_size,
+            seed=getattr(args, "seed", 0),
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,        # batch_size/sampler 없이
+            pin_memory=True,
+            num_workers=args.dataset_num_worker,
+        )
+    else:
+        dataloader = DataLoader(                # 기존 경로 (그대로)
+            dataset,
+            batch_size=args.batch_size,
+            sampler=ddp_sampler,
+            pin_memory=True,
+            num_workers=args.dataset_num_worker,
+        )
     val_dataloader = None
     if args.eval_video_path is not None:
         val_dataset = ValidVideoDataset(
@@ -1284,22 +1421,28 @@ def train(args):
     if getattr(args, 'eval_resolutions_hd', None):
         for res_str in args.eval_resolutions_hd.split(','):
             res_str = res_str.strip()
+            hd_num_frames = args.eval_num_frames           # [NEW] default = 기존 eval frame 수
             if 'x' in res_str:
-                h, w = map(int, res_str.split('x'))
+                parts = list(map(int, res_str.split('x')))
+                if len(parts) == 3:                        # [NEW] "HxWxF" → frame 수 지정 (예: 480x832x81)
+                    h, w, hd_num_frames = parts
+                    name_tag = f"{h}x{w}x{hd_num_frames}"
+                else:
+                    h, w = parts
+                    name_tag = f"{h}x{w}"
                 res = (h, w)
-                name_tag = f"{h}x{w}"
             else:
                 res = int(res_str)
                 name_tag = str(res)
             hd_bs = max(1, args.eval_batch_size // 4)  # 고해상도는 batch 줄임
             hd_dataset = ValidVideoDataset(
                 real_video_dir=args.eval_video_path,
-                num_frames=args.eval_num_frames,
+                num_frames=hd_num_frames,                  # [NEW] HxWxF면 F, 아니면 eval_num_frames
                 sample_rate=args.eval_sample_rate,
                 crop_size=res,
                 resolution=res,
             )
-            hd_subset = Subset(hd_dataset, indices=range(args.eval_subset_size))
+            hd_subset = Subset(hd_dataset, indices=range(args.eval_hd_subset_size))  # [NEW] base eval과 분리
             hd_sampler = CustomDistributedSampler(hd_subset)
             hd_loader = DataLoader(hd_subset, batch_size=hd_bs, sampler=hd_sampler, pin_memory=True)
             hd_val_dataloaders.append((name_tag, hd_loader))
@@ -1408,6 +1551,7 @@ def train(args):
             logger.info(f"[diffusion] block_norms_mod optimizer received {len(_block_norms_mod_params)} tensors "
                         f"({sum(p.numel() for p in _block_norms_mod_params):,} params) at lr={args.patchify_lr}")
     gen_optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+    _warmup_target_lrs = [pg['lr'] for pg in gen_optimizer.param_groups]  # [NEW] warmup: per-group 목표 lr 보존 (ramp 끝나면 이 값)
     disc_optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, disc.module.discriminator.parameters()), lr=args.lr, weight_decay=0.01
     )
@@ -1560,6 +1704,8 @@ def train(args):
                    "align_loss": 0.0, "total_loss": 0.0}
     # [FIX] optim step 초기화: resume 시 ckpt 의 optim_step 사용 (= accum 변경 시 일관성). fresh 시 0.
     optimizer_step = _resume_optim_step if args.resume_from_checkpoint and '_resume_optim_step' in dir() else 0
+    _warmup_anchor_step = optimizer_step  # [NEW] warmup 기준점 = 이 run 시작 optimizer_step (resume 후 N step 동안 0->target ramp)
+    _initial_eval_done = False   # [NEW] resume/start 직후 1회 initial eval (8500 baseline 을 wandb step 처음에)
 
     if global_rank == 0:
         torch.cuda.empty_cache()
@@ -1576,6 +1722,9 @@ def train(args):
             if args.max_steps is not None and current_step >= args.max_steps:
                 break
             inputs = batch["video"].to(rank)
+            # [NEW - mixed-length] 이번 배치 프레임수 로깅 (17/81 섞이는지 확인). forward/loss/align 은 T 자동 처리.
+            if args.mix_frames and global_rank == 0:
+                logger.info(f"[mix] step {current_step}: frames={inputs.shape[2]} batch={inputs.shape[0]}")
 
             # [DEBUG] per-step memory logging
             if global_rank == 0:
@@ -1618,6 +1767,15 @@ def train(args):
                         wavelet_coeffs=wavelet_coeffs,
                         split="train",
                     )
+
+                # [NEW - mixed-length] per-duration rec_loss (dense, 매 gen step) — 81f/17f 따로 wandb.
+                #   sparse 한 gnorm(10step+81f) 과 달리 81f loss 궤적을 dense 하게 추적.
+                if args.mix_frames and global_rank == 0:
+                    _mtag = "81f" if inputs.shape[2] >= args.mix_81_num_frames else "17f"
+                    try:
+                        wandb.log({f"mix/rec_loss_{_mtag}": float(g_log['train/rec_loss'])}, step=optimizer_step)
+                    except Exception:
+                        pass
 
                 # ─── [NEW - oliviaa/dit_align] DiT dual-branch alignment ───
                 align_loss = torch.tensor(0.0, device=rank)
@@ -1932,8 +2090,8 @@ def train(args):
                     _mem_peak = torch.cuda.max_memory_allocated(rank) / 1e9
                     logger.info(f"[mem] step {current_step} post-backward: allocated={_mem_post_bwd:.2f}GB, peak={_mem_peak:.2f}GB")
 
-                # [v27] grad norm log (= 두 run 동등성 비교용, K=10 step 마다, rank0 only)
-                if global_rank == 0 and (current_step % 10 == 0):
+                # grad norm log (rank0 only, log_steps 마다 = 매스텝). (구 v27 K=10 하드코딩 제거)
+                if global_rank == 0 and (current_step % args.log_steps == 0):
                     try:
                         _wrap = model.module if hasattr(model, 'module') else model
                         _vae = _wrap.vae
@@ -1964,6 +2122,22 @@ def train(args):
                             _ap_wn_sq = sum(p.detach().float().norm().item() ** 2
                                             for p in _ap if p.requires_grad)
                             _log["weight/align_projections_norm"] = _ap_wn_sq ** 0.5
+                        # [NEW - jeeyoung] encoder.head 에서 rec/align gradient norm 분리 로깅.
+                        #   gnorm/encoder_head = 둘 합산값. 분리값(합산 전)은 AdaptiveWeightedConv3dFn 가 저장.
+                        try:
+                            from adaptive_weighted_causal_conv_3d import _AdaptiveWeightedConv3dFn as _AWF
+                            if getattr(_AWF, '_last_grad_W_main_norm', None) is not None:
+                                _log["gnorm/encoder_head_rec"]   = float(_AWF._last_grad_W_main_norm.item())
+                                _log["gnorm/encoder_head_align"] = float(_AWF._last_grad_W_adv_norm.item())
+                        except Exception:
+                            pass
+                        # [NEW - mixed-length B] 81f가 decoder+align 둘 다 학습시키는지 검증 (프레임수별 분리).
+                        #   mix/align_gnorm_81f > 0 = 81f batch가 align projection까지 grad 흘림 (B 핵심).
+                        if args.mix_frames:
+                            _tag = "81f" if inputs.shape[2] >= args.mix_81_num_frames else "17f"
+                            _log[f"mix/decoder_gnorm_{_tag}"] = _log["gnorm/decoder"]
+                            if _ap:
+                                _log[f"mix/align_gnorm_{_tag}"] = _log["gnorm/align_projections"]
                         # [NEW] diffusion: davae_head grad norm (= diffusion grad 흐름 검증)
                         _dh_module = getattr(model.module, 'davae_head', None)
                         if _dh_module is not None:
@@ -2093,6 +2267,30 @@ def train(args):
 
                     # [NEW - oliviaa] gradient clipping + norm 로깅
                     scaler.unscale_(gen_optimizer)
+                    # [NEW - jeeyoung] per-component grad clip (decoder/encoder_head/encoder_body 따로 조절, arg)
+                    #   각 그룹 따로 clip + pre/post norm 로깅(clip 잘 되는지 검증, return값이라 추가비용 ~0).
+                    _vae_c = model.module.vae if hasattr(model.module, 'vae') else model.module
+                    _do_clip_log = (not args.no_log_grad and global_rank == 0 and current_step % args.log_steps == 0)
+                    _clip_log = {}
+                    for _cname, _cparams, _cval in [
+                        ('decoder',      list(_vae_c.decoder.parameters()),                                        getattr(args, 'decoder_grad_clip', 0.0)),
+                        ('encoder_head', [_vae_c.encoder.head[-1].weight, _vae_c.encoder.head[-1].bias],           getattr(args, 'encoder_head_grad_clip', 0.0)),
+                        ('encoder_body', [p for n, p in _vae_c.encoder.named_parameters() if 'head.2' not in n],  getattr(args, 'encoder_body_grad_clip', 0.0)),
+                        ('align_projections', list(model.module.align_projections.parameters()) if getattr(model.module, 'align_projections', None) is not None else [], getattr(args, 'align_projections_grad_clip', 0.0)),
+                        ('student_patchify',  list(student_patchify.parameters()) if student_patchify is not None else [],                                              getattr(args, 'student_patchify_grad_clip', 0.0)),
+                    ]:
+                        if _cval > 0 and _cparams:
+                            _pre = torch.nn.utils.clip_grad_norm_(_cparams, _cval)   # clip 실행 + pre-clip norm 반환
+                            if _do_clip_log:
+                                _clip_log[f"clip/{_cname}_preclip"] = float(_pre.item())
+                    if _clip_log:
+                        try:
+                            wandb.log(_clip_log, step=optimizer_step)
+                        except Exception as _ce:
+                            logger.warning(f"[clip] wandb log 실패: {_ce}")
+                    elif _do_clip_log:
+                        logger.warning(f"[clip] _clip_log 비어있음 (decoder_clip={getattr(args,'decoder_grad_clip',0)})")
+                    # 기존 whole-model max_grad_norm (default 0=off, 호환 유지)
                     _max_grad_norm = getattr(args, 'max_grad_norm', 0.0)
                     if _max_grad_norm > 0:
                         _all_params = list(model.parameters())
@@ -2141,6 +2339,18 @@ def train(args):
                         if '_patchify_output_ref' in dir() and hasattr(_patchify_output_ref, 'grad') and _patchify_output_ref.grad is not None:
                             _grad_log["grad/patchify_output"] = _patchify_output_ref.grad.norm().item()
                         wandb.log(_grad_log, step=optimizer_step)
+
+                    # [NEW - warmup] linear LR warmup: 이 run 시작(_warmup_anchor_step) 기준 N optimizer step 동안 0->target ramp.
+                    #   각 param_group 의 목표 lr(_warmup_target_lrs)에 factor 곱함. warmup 끝나면 factor=1 (target 고정).
+                    if args.warmup_steps > 0:
+                        _wf = min(1.0, max(0, optimizer_step - _warmup_anchor_step) / float(args.warmup_steps))
+                        for _i, _pg in enumerate(gen_optimizer.param_groups):
+                            _pg['lr'] = _warmup_target_lrs[_i] * _wf
+                        if global_rank == 0 and current_step % args.log_steps == 0:
+                            try:
+                                wandb.log({"lr/vae": gen_optimizer.param_groups[0]['lr'], "lr/warmup_factor": _wf}, step=optimizer_step)
+                            except Exception:
+                                pass
 
                     scaler.step(gen_optimizer)
                     scaler.update()
@@ -2363,7 +2573,7 @@ def train(args):
                 _loader = dataloader if dataloader is not None else val_dataloader
                 # [NEW - oliviaa/dit_align] dit_pipe 를 valid() 에 주입
                 valid._dit_pipe = dit_pipe
-                psnr_list, lpips_list, video_log, z_main_vecs, z_prior_vecs, z_cat_vecs, z_ref_vecs = valid(
+                psnr_list, lpips_list, video_log, z_main_vecs, z_prior_vecs, z_cat_vecs, z_ref_vecs, pr, low_freq, noise_robust = valid(
                     global_rank, rank, model, _loader, precision, args,
                     lpips_model=shared_lpips_model,
                 )
@@ -2393,7 +2603,23 @@ def train(args):
                     _vid_arr = np.array(valid_video_log)
                     wandb.log({f"val{name}/recon": wandb.Video(_vid_arr, fps=10)}, step=optimizer_step)
                     wandb.log({f"val{name}/psnr": valid_psnr}, step=optimizer_step)
+                    logger.info(f"[val-psnr] val{name}/psnr = {valid_psnr:.2f}dB  lpips = {valid_lpips:.4f}")  # [NEW] stdout 출력 (모니터링용)
                     wandb.log({f"val{name}/lpips": valid_lpips}, step=optimizer_step)
+                    # [NEW - jeeyoung] decode frame 수 검증 — 학습 중 chunked-decode frame 손실(17->15 / 81->71) 없는지 모니터.
+                    #   in-training 은 force_single_pass 라 손실 0 이어야 정상 (input_T == decode_T).
+                    _fc = getattr(valid, '_frame_check', None)
+                    if _fc is not None:
+                        wandb.log({f"val{name}/input_frames": _fc[0], f"val{name}/decode_frames": _fc[1]}, step=optimizer_step)
+                        logger.info(f"[frame-check] val{name}: input_T={_fc[0]} decode_T={_fc[1]} {'OK' if _fc[0]==_fc[1] else 'MISMATCH!!'}")
+                    # [NEW - jeeyoung] SSVAE diffusability — 480x832x81(HD) eval 에서만 로깅 (256 base 는 skip).
+                    #   "480" in name 으로 HD 판정 (name="_480x832x81" 또는 "_ema_480x832x81"). 256(EMA 포함) 제외.
+                    #   diffusability 는 stage2 해상도(480x832x81)에서만 의미 (256 low_freq 는 corner 비율 달라 비교 불가).
+                    if "480" in name:
+                        wandb.log({f"val{name}/diffusability_pr": pr}, step=optimizer_step)
+                        wandb.log({f"val{name}/diffusability_lowfreq": low_freq}, step=optimizer_step)
+                    # [NEW] noise robustness (sigma 별, rank-averaged)
+                    for _s, _v in (noise_robust or {}).items():
+                        wandb.log({f"val{name}/noise_robust_s{_s}": _v}, step=optimizer_step)
                     # z_main↔z_prior drift
                     if drift_metrics is not None:
                         wandb.log({f"val{name}/cknna_z_drift":      drift_metrics["cknna"]},      step=optimizer_step)
@@ -2416,7 +2642,7 @@ def train(args):
                         )
                     logger.info(f"{name} Validation done.")
 
-            if _is_accum_step and args.eval_video_path is not None and (optimizer_step % args.eval_steps == 0 or optimizer_step == 1):
+            if _is_accum_step and args.eval_video_path is not None and (optimizer_step % args.eval_steps == 0 or optimizer_step == 1 or not _initial_eval_done):
                 if global_rank == 0:
                     logger.info("Starting validation...")
                 valid_model(model)
@@ -2431,6 +2657,7 @@ def train(args):
                         ema.apply_shadow()
                         valid_model(model, f"ema_{_res_tag}", dataloader=_hd_loader)
                         ema.restore()
+                _initial_eval_done = True   # [NEW] initial eval 완료 표시 (이후엔 eval_steps 주기로만)
 
             # Checkpoint
             # [FIX - oliviaa] _is_accum_step 게이팅 추가
@@ -2490,6 +2717,8 @@ def main():
         "--batch_size", type=int, default=1, help="batch size for training"
     )
     parser.add_argument("--lr", type=float, default=1e-5, help="learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                        help="linear LR warmup: ramp 0->target over N optimizer steps from this run's start (0=off). resume 시에도 run 시작 기준.")
     parser.add_argument("--log_steps", type=int, default=5, help="log steps")
     parser.add_argument("--no_log_grad", action="store_true",
                         help="disable gradient norm logging and retain_grad (saves GPU memory)")
@@ -2503,6 +2732,15 @@ def main():
     # Data
     parser.add_argument("--video_path", type=str, default=None, help="")
     parser.add_argument("--num_frames", type=int, default=17, help="")
+    # [NEW - mixed-length / variant B] 17/81 혼합 학습 (align 유지 + decoder 81f). 끄면 기존 고정길이.
+    parser.add_argument("--mix_frames", action="store_true", default=False,
+                        help="배치마다 확률로 17/81 프레임 섞어 학습 (MixedLengthBatchSampler)")
+    parser.add_argument("--mix_81_prob", type=float, default=0.2,
+                        help="81프레임 배치가 뽑힐 확률")
+    parser.add_argument("--mix_81_num_frames", type=int, default=81,
+                        help="혼합에 섞을 긴 길이")
+    parser.add_argument("--mix_81_batch_size", type=int, default=2,
+                        help="81프레임 전용 배치 크기 (align@81f bs2=157GB 측정완료)")
     parser.add_argument("--resolution", type=int, default=256, help="")
     parser.add_argument("--sample_rate", type=int, default=2, help="")
     parser.add_argument("--dynamic_sample", action="store_true", help="")
@@ -2563,10 +2801,16 @@ def main():
     parser.add_argument("--eval_sample_rate", type=int, default=1, help="")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="")
     parser.add_argument("--eval_subset_size", type=int, default=100, help="")
+    parser.add_argument("--eval_hd_subset_size", type=int, default=4,
+                        help="HD eval(480x832x81 등) 전용 subset 크기 (base eval과 분리 — base 비교성 유지, HD는 적게=빠름)")
     # [NEW - oliviaa] Additional HD eval resolutions, comma-separated e.g. "512x512,480x832"
     parser.add_argument("--eval_resolutions_hd", type=str, default=None, help="")
     parser.add_argument("--eval_num_video_log", type=int, default=2, help="")
     parser.add_argument("--eval_lpips", action="store_true", help="")
+    parser.add_argument("--eval_noise_robust", action="store_true",
+                        help="validation 때 decoder noise robustness(sigma sweep PSNR) 측정")
+    parser.add_argument("--noise_robust_sigmas", type=str, default="0.1,0.2,0.3,0.5",
+                        help="noise robustness sigma 목록 (z_main std 배수)")
 
     # Dataset
     parser.add_argument("--dataset_num_worker", type=int, default=4, help="")
@@ -2794,6 +3038,17 @@ def main():
                         help="LPIPS를 chunk 단위로 순차 계산. 0=전체 한번에, >0=chunk size. batch_size>1일 때 메모리 절약")
     parser.add_argument("--max_grad_norm", type=float, default=0.0,
                         help="gradient clipping max norm. 0=비활성화, >0=clipping 적용. 7.0 권장")
+    # [NEW - jeeyoung] per-component grad clip (decoder/encoder 따로). 0=off.
+    parser.add_argument("--decoder_grad_clip", type=float, default=0.0,
+                        help="decoder param gradient norm clip (0=off)")
+    parser.add_argument("--encoder_head_grad_clip", type=float, default=0.0,
+                        help="encoder.head[-1] gradient norm clip (0=off)")
+    parser.add_argument("--encoder_body_grad_clip", type=float, default=0.0,
+                        help="encoder body(head[-1] 제외) gradient norm clip (0=off)")
+    parser.add_argument("--align_projections_grad_clip", type=float, default=0.0,
+                        help="align_projections per-module gradient norm clip (0=off)")
+    parser.add_argument("--student_patchify_grad_clip", type=float, default=0.0,
+                        help="student_patchify per-module gradient norm clip (0=off)")
 
     args = parser.parse_args()
 

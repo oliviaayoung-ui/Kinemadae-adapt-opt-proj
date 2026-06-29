@@ -112,7 +112,7 @@ except:
 from kinemadae import WanVAE_, _video_vae
 from perceptual_loss import LPIPSWithDiscriminator3D
 from ema_model import EMA
-from ddp_sampler import CustomDistributedSampler
+from ddp_sampler import CustomDistributedSampler, MixedLengthBatchSampler
 from video_dataset import TrainVideoDataset, ValidVideoDataset
 from video_utils import tensor_to_video
 from distrib_utils import DiagonalGaussianDistribution
@@ -489,6 +489,16 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
     video_log = []
     num_video_log = args.eval_num_video_log
 
+    # [NEW - jeeyoung] SSVAE-style diffusability — z_main(=encoder mu) per video 수집.
+    #   각 batch 의 mu (B, C, T, H, W) 를 video 단위로 쪼개 CPU float 로 보관(GPU mem 절약).
+    zmain_list = []
+
+    # [NEW] decoder noise robustness — z_main 에 sigma*std 노이즈 후 decode, clean recon 대비 PSNR.
+    _noise_sigmas = ([float(x) for x in getattr(args, 'noise_robust_sigmas', '0.1,0.2,0.3,0.5').split(',')]
+                     if getattr(args, 'eval_noise_robust', False) else [])
+    noise_robust_acc = {s: [] for s in _noise_sigmas}
+    noise_robust_gt_acc = {s: [] for s in _noise_sigmas}  # [NEW] GT(input 원본영상) 대비 noise robustness
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             inputs = batch["video"].to(rank)
@@ -496,13 +506,28 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
                 outputs = model(inputs)
                 video_recon = outputs[0]
 
+            # [NEW - jeeyoung] diffusability 용 z_main(mu) 수집.
+            #   encode 의 return 가 (mu, log_var) 또는 ((mu, log_var), (mu_adv, log_var_adv)).
+            #   forward() (line 261-272) 와 동일한 tuple-handling 으로 첫 mu 만 취함.
+            with torch.cuda.amp.autocast(dtype=precision):
+                _enc = model.module.vae.encode(inputs, scale=None)
+                _is_b_adaptive = (isinstance(_enc, tuple) and len(_enc) == 2
+                                  and isinstance(_enc[0], tuple))
+                if _is_b_adaptive:
+                    (mu, _log_var), (_mu_adv, _log_var_adv) = _enc
+                else:
+                    mu, _log_var = _enc
+            for b in range(mu.shape[0]):
+                zmain_list.append(mu[b].detach().float().cpu())
+
             # Upload videos
             if global_rank == 0:
                 for i in range(len(video_recon)):
                     if num_video_log <= 0:
                         break
-                    gt_video = tensor_to_video(inputs[i])
-                    rec_video = tensor_to_video(video_recon[i])
+                    # [FIX] tensor_to_video는 [0,1] 입력 기대 → [-1,1] 입력/recon을 [0,1]로 매핑 (안 하면 영상 어두움)
+                    gt_video = tensor_to_video((inputs[i] + 1.0) / 2.0)
+                    rec_video = tensor_to_video((torch.clamp(video_recon[i], -1.0, 1.0) + 1.0) / 2.0)
                     # [FIX - jeeyoung] gt/recon (T,C,H,W) 프레임·H 불일치 방어 — 공통 길이로 crop 후 concat(axis=3=W).
                     #   stage1 recon 은 같은 입력이라 보통 동일하지만 stage2/align gen-snap 버그와 일관되게 방어.
                     _tt = min(gt_video.shape[0], rec_video.shape[0]); _hh = min(gt_video.shape[2], rec_video.shape[2])
@@ -510,6 +535,35 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
                     concat_video = np.concatenate([gt_video, rec_video], axis=3)
                     video_log.append(concat_video)
                     num_video_log -= 1
+
+            # [NEW] noise robustness — z_main 에 sigma*std 노이즈 후 decode, 같은 base 의 clean decode 대비 PSNR.
+            #   [FIX 포팅 dit_align] (1) mu(outputs[1], deterministic) base 고정 + 전용 clean decode 대비
+            #     (기존: video_recon=reparam샘플#1 대비 + _zcat=reparam샘플#2 → sigma=0 baseline 비0 버그),
+            #   (2) per-channel std (디퓨전 채널별 표준화 일치, global은 채널편차만큼 어긋남),
+            #   (3) decode 출력 [-1,1]→[0,1] 매핑 후 MSE (PSNR 동일 스케일, -6dB shift 제거).
+            if _noise_sigmas:
+                _vae = model.module.vae
+                _zdim = getattr(_vae, 'z_dim', 16)
+                _zp = _vae._encode_prior(inputs)
+                _zcat = torch.cat([outputs[1], _zp], dim=1)  # mu(deterministic), reparameterize 아님
+                _zstd = _zcat[:, :_zdim].float().std(dim=(0, 2, 3, 4), keepdim=True).to(_zcat.dtype)  # per-channel (1,C,1,1,1)
+                with torch.cuda.amp.autocast(dtype=precision):
+                    _clean_nr = _vae.decode(_zcat, scale=None)  # 같은 base clean decode (baseline=0 보장)
+                for _s in _noise_sigmas:
+                    _zc = _zcat.clone()
+                    _zc[:, :_zdim] = _zc[:, :_zdim] + (_s * _zstd) * torch.randn_like(_zc[:, :_zdim])
+                    with torch.cuda.amp.autocast(dtype=precision):
+                        _noisy = _vae.decode(_zc, scale=None)
+                    _tt = min(_noisy.shape[2], _clean_nr.shape[2], inputs.shape[2])
+                    _n01 = (torch.clamp(_noisy[:, :, :_tt].float(), -1.0, 1.0) + 1.0) / 2.0
+                    _c01 = (torch.clamp(_clean_nr[:, :, :_tt].float(), -1.0, 1.0) + 1.0) / 2.0
+                    _mse = torch.mean((_n01 - _c01) ** 2)
+                    noise_robust_acc[_s].append((-10.0 * torch.log10(_mse + 1e-12)).item())
+                    # [NEW] GT(input 원본영상) 대비 = 노이즈 latent decode vs 원본영상. clean decode가 아닌 GT 기준 → 노이즈로 인한 recon 품질 저하 측정(노이즈 클수록↓, clean psnr보다 낮음이 정상)
+                    _in01 = (torch.clamp(inputs[:, :, :_tt].float(), -1.0, 1.0) + 1.0) / 2.0
+                    _mse_gt = torch.mean((_n01 - _in01) ** 2)
+                    noise_robust_gt_acc[_s].append((-10.0 * torch.log10(_mse_gt + 1e-12)).item())
+                del _clean_nr
 
             B, C, T, H, W = inputs.shape
             inputs = rearrange(inputs, "b c t h w -> (b t) c h w").contiguous()
@@ -519,7 +573,10 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
 
             # Calculate per-video PSNR (one value per video, not per batch)
             # to avoid partial-batch bias when DDP gather averages across ranks
-            mse = torch.mean(torch.square(inputs - video_recon), dim=(1, 2, 3))  # (B*T,)
+            # [FIX] 입력 [-1,1] → PSNR은 [0,1] 매핑 후 MAX=1 (안 하면 -6dB 낮게 측정). LPIPS는 아래서 [-1,1] 원본 사용.
+            _in01 = (inputs + 1.0) / 2.0
+            _rec01 = (torch.clamp(video_recon, -1.0, 1.0) + 1.0) / 2.0
+            mse = torch.mean(torch.square(_in01 - _rec01), dim=(1, 2, 3))  # (B*T,)
             psnr_frames = 20 * torch.log10(1 / torch.sqrt(mse))  # (B*T,)
             psnr_per_video = psnr_frames.view(B, T).mean(dim=1)   # (B,) mean over frames
             psnr_list.extend(psnr_per_video.detach().cpu().tolist())
@@ -537,7 +594,68 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
                 bar.update()
             # Release gpus memory
             torch.cuda.empty_cache()
-    return psnr_list, lpips_list, video_log
+
+    # [NEW - jeeyoung] SSVAE diffusability metrics — per-channel STANDARDIZED z_main 위에서 계산.
+    #   (1) few-mode participation ratio: correlation eigenspectrum 의 PR(=clean latent 일수록 큼)
+    #   (2) low-freq ratio: 3D-DCT power 의 low-freq corner(각 축 첫 1/4) 비중.
+    #   NOTE: 각 rank 는 val set 의 shard 만 봄. local rank 에서 계산 후 두 scalar 를
+    #         all_reduce mean 으로 rank 간 평균(아래). rank 당 val video >= 4 가 정상(<4 면 NaN).
+    from scipy.fft import dctn   # np 는 모듈 레벨 사용 (함수 내 import 시 valid() 앞부분 np 사용이 UnboundLocalError)
+    #   [변경 포팅 dit_align] 기존 rank별 계산은 HD eval(16비디오/8rank=2<4)서 NaN→0이 됨.
+    #     이제 z_main 을 rank 간 all_gather 하여 rank0 에서 "전체 pool 1번" 계산 후 broadcast (HD도 16개 pool로 유효).
+    import torch.distributed as dist
+    _ws = dist.get_world_size() if dist.is_initialized() else 1
+    if _ws > 1:
+        _gathered = [None for _ in range(_ws)]
+        dist.all_gather_object(_gathered, [z.cpu() for z in zmain_list])   # 전 rank z_main(CPU) 수집
+        all_zmain = [z for sub in _gathered if sub for z in sub] if rank == 0 else []
+    else:
+        all_zmain = zmain_list
+    if rank == 0 or _ws == 1:
+        if len(all_zmain) >= 4:
+            Z = torch.stack(all_zmain).float()               # (Nv, C, T, H, W) — 전 rank pool
+            Nv, Cc, T, H, W = Z.shape
+            mean = Z.mean(dim=(0, 2, 3, 4), keepdim=True); std = Z.std(dim=(0, 2, 3, 4), keepdim=True) + 1e-8
+            Zs = (Z - mean) / std                            # per-channel unit-variance standardize
+            X = Zs.permute(1, 0, 2, 3, 4).reshape(Cc, -1)
+            cov = (X @ X.T) / (X.shape[1] - 1)
+            ev = torch.linalg.eigvalsh(cov).clamp(min=0).flip(0)
+            pr = (ev.sum() ** 2 / (ev ** 2).sum()).item()
+            lf = []
+            for v in range(Nv):
+                D = dctn(Zs[v].numpy(), axes=(-3, -2, -1), norm='ortho'); P = (D ** 2).mean(0)
+                lf.append(P[:max(1, T // 4), :max(1, H // 4), :max(1, W // 4)].sum() / P.sum())
+            low_freq = float(np.mean(lf))
+        else:
+            pr, low_freq = float('nan'), float('nan')
+    else:
+        pr, low_freq = float('nan'), float('nan')
+
+    # rank0 의 전체-pool 결과를 전 rank 로 broadcast (기존 all_reduce mean 대체)
+    _t = torch.tensor([pr, low_freq], device=rank, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.broadcast(_t, src=0)
+    pr, low_freq = _t[0].item(), _t[1].item()
+
+    # [NEW] noise robustness rank 평균 (sigma 별)
+    noise_robust = {}
+    noise_robust_gt = {}  # [NEW] GT 대비
+    if _noise_sigmas:
+        _nr = torch.tensor([(np.mean(noise_robust_acc[s]) if noise_robust_acc[s] else float('nan'))
+                            for s in _noise_sigmas], device=rank, dtype=torch.float32)
+        _nr = torch.nan_to_num(_nr, nan=0.0)
+        if dist.is_initialized():
+            dist.all_reduce(_nr, op=dist.ReduceOp.SUM); _nr /= dist.get_world_size()
+        noise_robust = {s: _nr[i].item() for i, s in enumerate(_noise_sigmas)}
+        # [NEW] GT 대비도 동일 rank 평균
+        _nrg = torch.tensor([(np.mean(noise_robust_gt_acc[s]) if noise_robust_gt_acc[s] else float('nan'))
+                             for s in _noise_sigmas], device=rank, dtype=torch.float32)
+        _nrg = torch.nan_to_num(_nrg, nan=0.0)
+        if dist.is_initialized():
+            dist.all_reduce(_nrg, op=dist.ReduceOp.SUM); _nrg /= dist.get_world_size()
+        noise_robust_gt = {s: _nrg[i].item() for i, s in enumerate(_noise_sigmas)}
+
+    return psnr_list, lpips_list, video_log, pr, low_freq, noise_robust, noise_robust_gt
 
 
 def gather_valid_result(psnr_list, lpips_list, video_log_list, rank, world_size):
@@ -871,13 +989,31 @@ def train(args):
         is_main_process=global_rank == 0,
     )
     ddp_sampler = CustomDistributedSampler(dataset)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=ddp_sampler,
-        pin_memory=True,
-        num_workers=args.dataset_num_worker,
-    )
+    if args.mix_frames:
+        # [NEW] 17/81 혼합 — batch_sampler 는 batch_size/sampler/shuffle 와 동시 사용 불가
+        batch_sampler = MixedLengthBatchSampler(
+            ddp_sampler,
+            batch_size=args.batch_size,
+            base_num_frames=args.num_frames,
+            mix_81_prob=args.mix_81_prob,
+            mix_81_num_frames=args.mix_81_num_frames,
+            mix_81_batch_size=args.mix_81_batch_size,
+            seed=getattr(args, "seed", 0),
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,        # batch_size/sampler 없이
+            pin_memory=True,
+            num_workers=args.dataset_num_worker,
+        )
+    else:
+        dataloader = DataLoader(                # 기존 경로 (그대로)
+            dataset,
+            batch_size=args.batch_size,
+            sampler=ddp_sampler,
+            pin_memory=True,
+            num_workers=args.dataset_num_worker,
+        )
     val_dataloader = None
     if args.eval_video_path is not None:
         val_dataset = ValidVideoDataset(
@@ -903,22 +1039,28 @@ def train(args):
     if getattr(args, 'eval_resolutions_hd', None):
         for res_str in args.eval_resolutions_hd.split(','):
             res_str = res_str.strip()
+            hd_num_frames = args.eval_num_frames           # [PORT main] default = 기존 eval frame 수
             if 'x' in res_str:
-                h, w = map(int, res_str.split('x'))
+                parts = list(map(int, res_str.split('x')))
+                if len(parts) == 3:                        # [PORT main] "HxWxF" → frame 수 (예: 480x832x81)
+                    h, w, hd_num_frames = parts
+                    name_tag = f"{h}x{w}x{hd_num_frames}"
+                else:
+                    h, w = parts
+                    name_tag = f"{h}x{w}"
                 res = (h, w)
-                name_tag = f"{h}x{w}"
             else:
                 res = int(res_str)
                 name_tag = str(res)
             hd_bs = max(1, args.eval_batch_size // 4)  # 고해상도는 batch 줄임
             hd_dataset = ValidVideoDataset(
                 real_video_dir=args.eval_video_path,
-                num_frames=args.eval_num_frames,
+                num_frames=hd_num_frames,                  # [PORT main] HxWxF면 F, 아니면 eval_num_frames
                 sample_rate=args.eval_sample_rate,
                 crop_size=res,
                 resolution=res,
             )
-            hd_subset = Subset(hd_dataset, indices=range(args.eval_subset_size))
+            hd_subset = Subset(hd_dataset, indices=range(getattr(args, 'eval_hd_subset_size', args.eval_subset_size)))  # [PORT main] base eval과 분리
             hd_sampler = CustomDistributedSampler(hd_subset)
             hd_loader = DataLoader(hd_subset, batch_size=hd_bs, sampler=hd_sampler, pin_memory=True)
             hd_val_dataloaders.append((name_tag, hd_loader))
@@ -996,10 +1138,13 @@ def train(args):
         model.module.load_state_dict(_ckpt["state_dict"]["gen_model"], strict=False)
         if "dics_model" in _ckpt["state_dict"]:
             disc.module.load_state_dict(_ckpt["state_dict"]["dics_model"])
+        # [FIX] val_ema 비교를 clipfix(full resume)와 공정하게 — init_vae_from도 11500의 EMA를 ema shadow로 로드.
+        #   raw gen_model은 학습용으로 model에 로드됨(위). EMA는 val_ema 지표용으로 아래 EMA 섹션에서 이걸 로드.
+        _init_vae_ema_sd = _ckpt.get("ema_state_dict", None)
         if global_rank == 0:
             logger.info(
                 f"[decoder_only] Weights-only init from {args.init_vae_from} "
-                f"(gen_model + disc; fresh optimizer/step/EMA, start at step 0)."
+                f"(gen_model + disc; fresh optimizer/step; EMA={'11500 EMA loaded' if _init_vae_ema_sd else 'fresh'}, start at step 0)."
             )
         del _ckpt
 
@@ -1007,8 +1152,9 @@ def train(args):
         logger.warning(f"Start with EMA. EMA decay = {args.ema_decay}.")
         ema = EMA(model, args.ema_decay)
         ema.register()
-        if args.resume_from_checkpoint and checkpoint.get("ema_state_dict"):
-            _ema_sd = checkpoint["ema_state_dict"]
+        # [FIX] resume면 checkpoint의 EMA, init_vae_from이면 그 ckpt의 EMA(_init_vae_ema_sd) 로드 → val_ema가 clipfix처럼 성숙 EMA(31.24)서 시작.
+        _ema_sd = checkpoint.get("ema_state_dict") if args.resume_from_checkpoint else locals().get('_init_vae_ema_sd')
+        if _ema_sd:
             # [NEW] new format: {'shadow': ..., 'shadow_buffers': ...} / legacy: dict 자체가 shadow
             if isinstance(_ema_sd, dict) and 'shadow' in _ema_sd and 'shadow_buffers' in _ema_sd:
                 _shadow_sd = _ema_sd['shadow']
@@ -1110,6 +1256,9 @@ def train(args):
             if args.max_steps is not None and current_step >= args.max_steps:
                 break
             inputs = batch["video"].to(rank)
+            # [NEW - mixed-length] 이번 배치 프레임수 로깅 (17/81 섞이는지 확인). forward/loss 는 T 자동 처리.
+            if args.mix_frames and global_rank == 0:
+                logger.info(f"[mix] step {current_step}: frames={inputs.shape[2]} batch={inputs.shape[0]}")
 
             # [DEBUG] per-step memory logging
             if global_rank == 0:
@@ -1204,6 +1353,13 @@ def train(args):
                             "gnorm/encoder_head":    _gn(_enc_head),
                             "gnorm/decoder":         _gn(_dec),
                         }
+                        # [NEW - mixed-length] 81f가 실제로 decoder를 학습시키는지 검증:
+                        #   프레임수별 decoder gnorm + rec_loss 분리 → wandb에서 17f/81f 따로 추적.
+                        #   mix/decoder_gnorm_81f > 0 = 81f loss가 decoder까지 흐름. mix/rec_loss_81f = 81f 품질.
+                        if args.mix_frames:
+                            _tag = "81f" if inputs.shape[2] >= args.mix_81_num_frames else "17f"
+                            _log[f"mix/decoder_gnorm_{_tag}"] = _log["gnorm/decoder"]
+                            _log[f"mix/rec_loss_{_tag}"] = g_log['train/rec_loss']
                         wandb.log(_log, step=optimizer_step)
                     except Exception as _ge:
                         if current_step < 5:
@@ -1351,7 +1507,7 @@ def train(args):
             def valid_model(model, name="", dataloader=None):
                 set_eval(modules_to_train)
                 _loader = dataloader if dataloader is not None else val_dataloader
-                psnr_list, lpips_list, video_log = valid(
+                psnr_list, lpips_list, video_log, pr, low_freq, noise_robust, noise_robust_gt = valid(
                     global_rank, rank, model, _loader, precision, args,
                     lpips_model=shared_lpips_model,
                 )
@@ -1367,6 +1523,15 @@ def train(args):
                     wandb.log({f"val{name}/recon": wandb.Video(_vid_arr, fps=10)}, step=optimizer_step)
                     wandb.log({f"val{name}/psnr": valid_psnr}, step=optimizer_step)
                     wandb.log({f"val{name}/lpips": valid_lpips}, step=optimizer_step)
+                    # [NEW - jeeyoung] SSVAE diffusability (rank-averaged in valid())
+                    wandb.log({f"val{name}/diffusability_pr": pr}, step=optimizer_step)
+                    wandb.log({f"val{name}/diffusability_lowfreq": low_freq}, step=optimizer_step)
+                    # [NEW] noise robustness (sigma 별, rank-averaged) — clean decode 대비 (decoder 안정성)
+                    for _s, _v in (noise_robust or {}).items():
+                        wandb.log({f"val{name}/noise_robust_s{_s}": _v}, step=optimizer_step)
+                    # [NEW] GT(input 원본영상) 대비 noise robustness — 노이즈 하 recon 품질
+                    for _s, _v in (noise_robust_gt or {}).items():
+                        wandb.log({f"val{name}/noise_robust_gt_s{_s}": _v}, step=optimizer_step)
                     logger.info(f"{name} Validation done.")
 
             if _is_accum_step and args.eval_video_path is not None and (optimizer_step % args.eval_steps == 0 or optimizer_step == 1):
@@ -1453,6 +1618,15 @@ def main():
     # Data
     parser.add_argument("--video_path", type=str, default=None, help="")
     parser.add_argument("--num_frames", type=int, default=17, help="")
+    # [NEW - mixed-length] 17/81 혼합 학습 (decoder temporal 붕괴 방지). 끄면 기존 고정길이.
+    parser.add_argument("--mix_frames", action="store_true", default=False,
+                        help="배치마다 확률로 17/81 프레임 섞어 학습 (MixedLengthBatchSampler)")
+    parser.add_argument("--mix_81_prob", type=float, default=0.2,
+                        help="81프레임 배치가 뽑힐 확률")
+    parser.add_argument("--mix_81_num_frames", type=int, default=81,
+                        help="혼합에 섞을 긴 길이")
+    parser.add_argument("--mix_81_batch_size", type=int, default=2,
+                        help="81프레임 전용 배치 크기 (메모리 때문에 작게)")
     parser.add_argument("--resolution", type=int, default=256, help="")
     parser.add_argument("--sample_rate", type=int, default=2, help="")
     parser.add_argument("--dynamic_sample", action="store_true", help="")
@@ -1521,10 +1695,15 @@ def main():
     parser.add_argument("--eval_sample_rate", type=int, default=1, help="")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="")
     parser.add_argument("--eval_subset_size", type=int, default=100, help="")
+    parser.add_argument("--eval_hd_subset_size", type=int, default=16, help="[PORT main] HD eval 전용 subset (base와 분리, clipfix 통일용)")
     # [NEW - oliviaa] Additional HD eval resolutions, comma-separated e.g. "512x512,480x832"
     parser.add_argument("--eval_resolutions_hd", type=str, default=None, help="")
     parser.add_argument("--eval_num_video_log", type=int, default=2, help="")
     parser.add_argument("--eval_lpips", action="store_true", help="")
+    parser.add_argument("--eval_noise_robust", action="store_true",
+                        help="validation 때 decoder noise robustness(sigma sweep PSNR) 측정")
+    parser.add_argument("--noise_robust_sigmas", type=str, default="0.1,0.2,0.3,0.5",
+                        help="noise robustness sigma 목록 (z_main std 배수)")
 
     # Dataset
     parser.add_argument("--dataset_num_worker", type=int, default=4, help="")

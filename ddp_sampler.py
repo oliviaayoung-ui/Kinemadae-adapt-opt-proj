@@ -145,4 +145,51 @@ class CustomDistributedSampler(Sampler[T_co]):
         self.epoch = state_dict['epoch']
         self.seed = state_dict['seed']
         self.current_index = state_dict.get('current_index', 0)
+
+
+class MixedLengthBatchSampler(Sampler):
+    """CustomDistributedSampler 위에서 배치마다 길이(17/81)+배치크기를 seed로 결정하는 batch_sampler.
+       - 모든 rank 가 같은 batch_idx -> 같은 (use81, L, bs) (seed 에 rank 안 넣음) -> DDP shape 동기화.
+       - index 는 rank별 다름 (base_sampler 가 rank shard) -> DDP 답게 데이터는 다르고 shape 만 같음.
+       - 전 rank 가 같은 indices 수 + 같은 bs 소비 -> 같은 배치 수 -> hang 없음.
+       Open-Sora VariableVideoBatchSampler(sampler.py:194) 의 간소판 (해상도 고정, 17/81 2-bucket).
+       yield 하는 "{idx}-{L}" 는 video_dataset.TrainVideoDataset.__getitem__ 이 파싱."""
+
+    def __init__(self, base_sampler, batch_size, base_num_frames,
+                 mix_81_prob, mix_81_num_frames, mix_81_batch_size, seed=0, drop_last=True):
+        self.base = base_sampler            # CustomDistributedSampler (rank별 shard)
+        self.batch_size = batch_size        # 17f 배치 크기
+        self.f17 = base_num_frames          # 기본 프레임수 (17)
+        self.prob = mix_81_prob             # 81f 가 뽑힐 확률
+        self.f81 = mix_81_num_frames        # 81
+        self.bs81 = mix_81_batch_size       # 81f 전용 배치 크기 (메모리 때문에 작게)
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        if hasattr(self.base, "set_epoch"):
+            self.base.set_epoch(epoch)      # base 도 같은 epoch (셔플 동기화)
+
+    def __iter__(self) -> Iterator:
+        indices = list(self.base)           # 이 rank 의 epoch 인덱스 (rank별 다름, 길이는 전 rank 동일)
+        i, b = 0, 0
+        while i < len(indices):
+            # rank 안 넣음 -> 모든 rank 가 같은 (use81, L, bs) -> 같은 step 에 같은 shape
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch * 1_000_003 + b)
+            use81 = torch.rand(1, generator=g).item() < self.prob
+            L = self.f81 if use81 else self.f17
+            bs = self.bs81 if use81 else self.batch_size
+            chunk = indices[i:i + bs]
+            i += bs
+            b += 1
+            if len(chunk) < bs and self.drop_last:
+                break                        # 마지막 partial drop (전 rank 동일 시점이라 안전)
+            yield [f"{idx}-{L}" for idx in chunk]   # video_dataset 이 "{idx}-{L}" 파싱
+
+    def __len__(self) -> int:
+        avg_bs = (1.0 - self.prob) * self.batch_size + self.prob * self.bs81
+        return max(1, int(len(self.base) / max(1.0, avg_bs)))   # random L 이라 근사값
         

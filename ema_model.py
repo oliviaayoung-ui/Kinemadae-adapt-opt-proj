@@ -22,7 +22,10 @@ class EMA:
     def update(self):
         # Parameter EMA (기존)
         for name, param in self.model.named_parameters():
-            if name in self.shadow:
+            # [FIX] frozen param(decoder-only의 encoder 등)은 EMA update 스킵 → shadow 고정(=로드된 11500 EMA값 유지, drift 방지).
+            #   register()는 trainable만 등록하므로 일반 케이스(shadow에 trainable만)는 동작 불변.
+            #   init_vae_from으로 frozen encoder를 shadow에 로드한 경우만 영향(그 encoder가 raw로 drift하던 버그 제거).
+            if name in self.shadow and param.requires_grad:
                 self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
         # [NEW] Buffer EMA — REPA-E update_ema 의 L92-95 과 동등
         for name, buf in self.model.named_buffers():
@@ -31,7 +34,9 @@ class EMA:
 
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
-            if name in self.shadow:
+            # [FIX] frozen param(decoder-only의 encoder)은 swap 안 함 → val_ema = raw encoder + EMA decoder.
+            #   register()가 trainable만 등록하므로 일반 케이스 불변. frozen encoder를 shadow에 로드한 경우만 영향.
+            if name in self.shadow and param.requires_grad:
                 self.backup[name] = param.data
                 param.data = self.shadow[name]
         # [NEW] buffer 도 apply
@@ -42,7 +47,7 @@ class EMA:
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if name in self.shadow:
+            if name in self.shadow and param.requires_grad:  # [FIX] apply_shadow과 일치 (frozen은 swap 안 했으니 restore도 안 함)
                 param.data = self.backup[name]
         self.backup = {}
         # [NEW] buffer 도 restore
