@@ -5,13 +5,13 @@
 #   val_ema = raw(frozen) encoder + EMA decoder (clean recon metric).
 #
 # ─── EDIT THESE PATHS (required) ─────────────────────────────────────────────
-WAN_CKPT=${WAN_CKPT:-/path/to/Wan2.1_VAE.pth}                 # pretrained Wan2.1 VAE
-VIDEO_TRAIN=${VIDEO_TRAIN:-/path/to/train_videos.txt}        # one video path per line
-VIDEO_EVAL=${VIDEO_EVAL:-/path/to/eval_videos.txt}           # one video path per line
+WAN_CKPT=${WAN_CKPT:-/NHNHOME/WORKSPACE/0226010404_A/CVLAB/CVLAB2/jeeyoung/checkpoints_persistent/Wan2.1-I2V-14B-480P/Wan2.1_VAE.pth}
+VIDEO_TRAIN=${VIDEO_TRAIN:-/NHNHOME/WORKSPACE/0226010404_A/CVLAB/CVLAB2/jeeyoung/KinemaDAE-kk4aiq-to-lora/panda70m_train.txt}
+VIDEO_EVAL=${VIDEO_EVAL:-/NHNHOME/WORKSPACE/0226010404_A/CVLAB/CVLAB2/jeeyoung/KinemaDAE-kk4aiq-to-lora/panda70m_eval.txt}
 # Start point: choose ONE of the two below.
 #   INIT_CKPT   = weights-only warm start (fresh optimizer, step 0)   -> --init_vae_from
 #   RESUME_CKPT = full resume (optimizer+step+EMA+sampler restored)   -> --resume_from_checkpoint
-INIT_CKPT=${INIT_CKPT:-/path/to/your_trained_geoprior_vae.ckpt}
+INIT_CKPT=${INIT_CKPT:-/NHNHOME/WORKSPACE/0226010404_A/CVLAB/CVLAB2/jeeyoung/Kinemadae-adaptive-Bfix/results/preserved_ckpt11500_for_clipfix.ckpt}
 RESUME_CKPT=${RESUME_CKPT:-}                                  # set this to resume instead of init
 # ─────────────────────────────────────────────────────────────────────────────
 NUM_GPUS=${NUM_GPUS:-8}
