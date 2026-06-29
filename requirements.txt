@@ -1,0 +1,12 @@
+torch>=2.1
+torchvision
+numpy
+scipy
+einops
+Pillow
+colorlog
+opencv-python
+decord
+requests
+tqdm
+wandb
