@@ -499,6 +499,13 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
     noise_robust_acc = {s: [] for s in _noise_sigmas}
     noise_robust_gt_acc = {s: [] for s in _noise_sigmas}  # [NEW] GT(input 원본영상) 대비 noise robustness
 
+    # [FIX 2026-06-30] set_eval(modules_to_train)로 model이 eval 모드면 geoprior decode가
+    #   chunked 경로(frame-by-frame)로 돌아 framedrop(81→71 등) → recon ~2dB 낮게 측정됨.
+    #   valid 동안 single-pass 강제(메모리: model.module.vae가 올바른 객체) 후 복원.
+    _fsp_vae = getattr(model, 'module', model).vae
+    _prev_fsp = getattr(_fsp_vae, 'force_single_pass', False)
+    _fsp_vae.force_single_pass = True
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             inputs = batch["video"].to(rank)
@@ -655,6 +662,7 @@ def valid(global_rank, rank, model, val_dataloader, precision, args, lpips_model
             dist.all_reduce(_nrg, op=dist.ReduceOp.SUM); _nrg /= dist.get_world_size()
         noise_robust_gt = {s: _nrg[i].item() for i, s in enumerate(_noise_sigmas)}
 
+    _fsp_vae.force_single_pass = _prev_fsp  # [FIX 2026-06-30] valid 끝 → force_single_pass 복원
     return psnr_list, lpips_list, video_log, pr, low_freq, noise_robust, noise_robust_gt
 
 
